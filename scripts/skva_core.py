@@ -1436,6 +1436,137 @@ class SkillRouter:
 
 
 # ═══════════════════════════════════════════════════
+# TZ GAP CLOSURES: SSH, Gate, Verify, Budget, Phases
+# ═══════════════════════════════════════════════════
+
+@dataclass
+class SSHProfile:
+    host: str
+    user: str = "agent"
+    port: int = 22
+    identity_file: Optional[str] = None
+    env: Dict[str, str] = field(default_factory=dict)
+
+
+async def spawn_ssh_agent(profile: SSHProfile, cmd: str):
+    """Launch command on remote machine via SSH."""
+    ssh_cmd = ["ssh", "-p", str(profile.port),
+               "-o", "ConnectTimeout=10",
+               "-o", "StrictHostKeyChecking=no"]
+    if profile.identity_file:
+        ssh_cmd += ["-i", profile.identity_file]
+    ssh_cmd.append(f"{profile.user}@{profile.host}")
+    ssh_cmd.append(cmd)
+    log(f"SSH: {profile.user}@{profile.host}:{profile.port} $ {cmd[:80]}")
+    return await asyncio.create_subprocess_exec(*ssh_cmd,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+
+
+# ─────────────────────────────────────────────
+
+class Gate:
+    """Filesystem-based gate protocol for agent synchronization."""
+    def __init__(self, project_dir: str, name: str):
+        self.path = Path(project_dir) / ".skva" / "gates" / f"{name}.gate"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def set(self):
+        self.path.write_text(str(time.time()))
+        log(f"Gate set: {self.path.name}")
+
+    def clear(self):
+        if self.path.exists():
+            self.path.unlink()
+
+    async def wait(self, timeout: float = 300) -> bool:
+        for _ in range(int(timeout * 10)):
+            if self.path.exists():
+                return True
+            await asyncio.sleep(0.1)
+        log(f"Gate timeout: {self.path.name}", "WARN")
+        return False
+
+    def is_open(self) -> bool:
+        return self.path.exists()
+
+    def __str__(self):
+        return f"Gate({self.path.name}: {'open' if self.is_open() else 'closed'})"
+
+
+# ─────────────────────────────────────────────
+
+def verify_files(file_paths, max_size: int = 50000):
+    """Verify output files against constraints. Returns dict of path -> issue."""
+    results = {}
+    for p in file_paths:
+        p = Path(p)
+        if not p.exists():
+            results[str(p)] = "missing"
+        elif p.stat().st_size > max_size:
+            results[str(p)] = "too_large"
+        elif not p.read_text(errors='replace').strip():
+            results[str(p)] = "empty"
+    if results:
+        log(f"Verify: {len(results)} issues: {list(results.values())[:3]}...", "WARN")
+    return results
+
+
+# ─────────────────────────────────────────────
+
+@dataclass
+class Budget:
+    max_tokens: int = 100000
+    max_cost: float = 1.0
+    spent_tokens: int = 0
+    spent_cost: float = 0.0
+
+    def track(self, tokens: int, cost: float) -> bool:
+        if self.spent_tokens + tokens > self.max_tokens:
+            log(f"Budget token limit exceeded ({self.spent_tokens + tokens} > {self.max_tokens})", "ERROR")
+            return False
+        if round(self.spent_cost + cost, 6) > self.max_cost:
+            log(f"Budget cost limit exceeded (${self.spent_cost + cost:.4f} > ${self.max_cost:.2f})", "ERROR")
+            return False
+        self.spent_tokens += tokens
+        self.spent_cost = round(self.spent_cost + cost, 6)
+        return True
+
+    def remaining_tokens(self) -> int:
+        return self.max_tokens - self.spent_tokens
+
+    def __str__(self):
+        return f"Budget: {self.spent_tokens}/{self.max_tokens} tok, ${self.spent_cost:.4f}/${self.max_cost:.2f}"
+
+
+# ─────────────────────────────────────────────
+
+class Phase(str, Enum):
+    ANALYZE = "analyze"
+    DESIGN = "design"
+    IMPLEMENT = "implement"
+    REVIEW = "review"
+    FIX = "fix"
+    DEPLOY = "deploy"
+
+ROLE_PHASES = {
+    "analyst": Phase.ANALYZE,
+    "architect": Phase.DESIGN,
+    "developer": Phase.IMPLEMENT,
+    "fullstack": Phase.IMPLEMENT,
+    "qa": Phase.REVIEW,
+    "devops": Phase.DEPLOY,
+    "mentor": Phase.REVIEW,
+}
+
+METHOD_PHASES = {
+    "solo": [Phase.IMPLEMENT],
+    "rada": [Phase.ANALYZE, Phase.IMPLEMENT, Phase.DEPLOY],
+    "agile": [Phase.DESIGN, Phase.IMPLEMENT, Phase.REVIEW, Phase.FIX],
+    "pipeline": [Phase.ANALYZE, Phase.DESIGN, Phase.IMPLEMENT, Phase.REVIEW, Phase.DEPLOY],
+}
+
+
+# ═══════════════════════════════════════════════════
 # SELF IMPROVER
 # ═══════════════════════════════════════════════════
 
