@@ -1,0 +1,13 @@
+# templates/project-config.yaml
+project:
+  name: "my-project"
+  method: "auto"  # auto | solo | rada-fabryka | agile | pipeline
+  priority: P2    # P0 (critical) | P1 (high) | P2 (normal) | P3 (low)
+budget:
+  max_cost: 100
+  model_selection: auto
+  warn_at: 80
+  stop_at: 100
+notify:
+  telegram: true
+  on: [complete, fail]

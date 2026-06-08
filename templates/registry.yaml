@@ -1,0 +1,26 @@
+# templates/registry.yaml
+machines:
+  - name: local
+    transport: terminal
+    host: localhost
+    max_agents: 3
+    roles:
+      - Fullstack
+      - Developer
+      - Architect
+    models:
+      - deepseek-flash
+      - deepseek
+      - qwen3-235b
+
+  # SSH machines — uncomment and configure:
+  # - name: remote-server
+  #   transport: ssh
+  #   host: 192.168.1.100
+  #   user: user
+  #   key: ~/.ssh/id_rsa
+  #   max_agents: 2
+  #   roles:
+  #     - Developer
+  #   models:
+  #     - qwen3-235b
