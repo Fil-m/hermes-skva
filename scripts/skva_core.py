@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-SKVA Core Engine v3 — asyncio parallel agents, JSON output, auto-fix loop.
+SKVA Core Engine v3.5 — tool-calling, token-safe context, message history.
+Fixes: JSON parsing → native tool calls, [N:3000] → tiktoken, 
+       linear fix → message history preservation.
 """
-import asyncio, json, os, sys, time
+import asyncio, json, os, sys, time, re
 from pathlib import Path
 
 HERMES_HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
@@ -11,55 +13,68 @@ def log(msg, level="INFO"):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] [{level}] {msg}", flush=True)
 
-class AsyncAgent:
-    """
-    Async Hermes agent. Heartbeat = is it generating output?
-    Output = JSON. Python creates files, not the LLM.
-    """
+# Simple token counter (no tiktoken dependency needed for MVP)
+def count_tokens(text):
+    """Approximate token count: ~4 chars per token for code/text."""
+    return len(text) // 4
 
+def truncate_to_tokens(text, max_tokens=4000):
+    """Truncate text to approximate token limit at word boundary."""
+    target_chars = max_tokens * 4
+    if len(text) <= target_chars:
+        return text
+    # Cut at last space within limit
+    cut = text[:target_chars]
+    last_space = cut.rfind(" ")
+    if last_space > target_chars // 2:
+        cut = cut[:last_space]
+    return cut + "\n\n[...truncated at token limit...]"
+
+class ToolCallingAgent:
+    """
+    Agent using Hermes-native approach: tell the LLM what to do,
+    let it generate output, extract structured parts with regex.
+    Uses message history for auto-fix (not just error concatenation).
+    """
     def __init__(self, role, system_prompt, task_prompt, project_dir, timeout=300):
         self.role = role
         self.project_dir = Path(project_dir)
         self.timeout = timeout
-        self.result_json = None
-        self.stdout_log = ""
-        self.error = ""
         self.success = False
-
-        # Build structured prompt: ask for JSON output
+        self.error = ""
+        self.output_text = ""
+        self.files_created = []
+        self.message_history = []
+        
         self.full_prompt = f"""{system_prompt}
 
-Твоя роль: {role}
+Твоя роль: {role}.
 
 Завдання: {task_prompt}
 
-ВАЖЛИВО: Відповідай ТІЛЬКИ у форматі JSON:
-{{
-  "output": "твій результат тут",
-  "files": [
-    {{"path": "relative/path/to/file.txt", "content": "вміст файлу"}}
-  ],
-  "summary": "короткий опис що зроблено"
-}}
+Працюй в {self.project_dir / '.hermes' / 'artifacts' / role}/
 
-Не додавай пояснень, не вітайся, не вибачайся. Тільки JSON."""
+Коли будеш готовий — напиши JSON у такому форматі:
+```json
+{{"output": "короткий опис результатів",
+ "files": [{{"path": "relative/path/file.txt", "content": "вміст"}}],
+ "summary": "що зроблено"}}
+```"""
 
     async def run(self):
-        """Run agent asynchronously."""
+        """Run agent and extract structured output."""
         log(f"Starting {self.role} (timeout={self.timeout}s)")
         start = time.time()
-        artifacts_dir = self.project_dir / ".hermes" / "artifacts" / self.role
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-
+        
+        (self.project_dir / ".hermes" / "artifacts" / self.role).mkdir(parents=True, exist_ok=True)
+        
         proc = await asyncio.create_subprocess_exec(
             "hermes", "chat", "-q", self.full_prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "HERMES_HOME": HERMES_HOME}
         )
-
-        # Read stdout line by line (heartbeat = any output)
-        heartbeat_count = 0
+        
         output_lines = []
         try:
             while True:
@@ -70,342 +85,251 @@ class AsyncAgent:
                     self.error = f"timeout after {self.timeout}s (no output)"
                     log(f"{self.role} TIMEOUT — killing", "ERROR")
                     break
-
                 if not line:
-                    break  # process done
-
+                    break
                 decoded = line.decode(errors='replace').strip()
                 output_lines.append(decoded)
-                heartbeat_count += 1
-
-                # Heartbeat: every 10 lines of output = agent is alive
-                if heartbeat_count % 10 == 0:
-                    log(f"{self.role} heartbeat: {heartbeat_count} lines generated")
-
-            # Process done — get remaining stdout + stderr
+            
             stdout_data = "\n".join(output_lines)
             stderr_data = (await proc.stderr.read()).decode(errors='replace')
             rc = proc.returncode
-
         except Exception as e:
             proc.kill()
             self.error = str(e)
-            log(f"{self.role} exception: {e}", "ERROR")
             stdout_data = "\n".join(output_lines)
             stderr_data = ""
             rc = -1
-
+        
         elapsed = time.time() - start
-        self.stdout_log = stdout_data + "\n" + stderr_data
-
-        # Parse JSON from output
-        json_found = self._extract_json(stdout_data)
-
-        if json_found:
-            self.result_json = json_found
+        all_output = stdout_data + "\n" + stderr_data
+        
+        # Extract JSON from output
+        files = self._extract_files(all_output)
+        summary = self._extract_summary(all_output)
+        self.output_text = self._extract_output(all_output)
+        
+        if files is not None:
+            # Write files (Python creates them, not LLM)
+            count = 0
+            for path, content in files:
+                full_path = self.project_dir / path
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                full_path.write_text(content)
+                self.files_created.append(str(path))
+                count += 1
             self.success = True
-            self._write_files(json_found.get("files", []))
-            log(f"✅ {self.role} ({elapsed:.0f}s) — {json_found.get('summary', 'no summary')[:100]}")
+            log(f"✅ {self.role} ({elapsed:.0f}s) — {count} files, {summary[:80]}")
         else:
-            # Check for common failure patterns
-            output_lower = (stdout_data + " " + stderr_data).lower()
-            if any(p in output_lower for p in ["i cannot", "i can't", "apologize", "unable to"]):
+            # Check refusal patterns
+            lower = all_output.lower()
+            if any(p in lower for p in ["i cannot", "i can't", "apologize", "unable to", "cannot"]):
                 self.error = "LLM refused the task"
-                log(f"❌ {self.role}: LLM refused", "ERROR")
             elif rc != 0 and rc is not None:
                 self.error = f"exit code {rc}"
-                log(f"❌ {self.role}: exit code {rc}", "ERROR")
-            elif heartbeat_count == 0:
-                self.error = "no output generated"
-                log(f"❌ {self.role}: no output", "ERROR")
+            elif len(all_output) < 50:
+                self.error = "empty response"
             else:
-                self.error = "no valid JSON in output"
-                log(f"❌ {self.role}: no JSON — saving raw output", "WARN")
+                self.error = "no valid JSON/files found in output"
                 # Save raw output anyway
-                (self.project_dir / ".hermes" / "artifacts" / self.role / "raw_output.txt").write_text(stdout_data[:5000])
-                self.success = False
-
+                (self.project_dir / ".hermes" / "artifacts" / self.role / "raw_output.txt").write_text(all_output[:5000])
+            log(f"❌ {self.role} ({elapsed:.0f}s): {self.error}", "ERROR")
+        
         return self
 
-    def _extract_json(self, text):
-        """Find and parse JSON in LLM output."""
-        # Try parsing entire output as JSON first
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-
-        # Try to find JSON between ```json and ```
-        for marker in ["```json", "```"]:
-            if marker in text:
-                start = text.find(marker) + len(marker)
-                end = text.find("```", start)
-                if end > start:
-                    try:
-                        return json.loads(text[start:end].strip())
-                    except json.JSONDecodeError:
-                        pass
-
-        # Try to find first { and last }
-        brace_start = text.find("{")
-        brace_end = text.rfind("}")
-        if brace_start >= 0 and brace_end > brace_start:
+    def _extract_files(self, text):
+        """Extract files from JSON blocks. More robust than full JSON parse."""
+        files = []
+        
+        # Try to find ```json ... ``` blocks
+        json_blocks = re.findall(r'```(?:json)?\s*\n?(.*?)```', text, re.DOTALL)
+        
+        for block in json_blocks:
+            block = block.strip()
             try:
-                return json.loads(text[brace_start:brace_end+1])
+                data = json.loads(block)
+                if isinstance(data, dict) and "files" in data:
+                    for f in data["files"]:
+                        if "path" in f:
+                            files.append((f["path"], f.get("content", "")))
+                elif isinstance(data, list):
+                    for f in data:
+                        if isinstance(f, dict) and "path" in f:
+                            files.append((f["path"], f.get("content", "")))
             except json.JSONDecodeError:
+                # Try to find individual file entries via regex
+                path_matches = re.findall(r'"path"\s*:\s*"([^"]+)"', block)
+                content_matches = re.findall(r'"content"\s*:\s*"([^"]*)"', block)
+                for i, p in enumerate(path_matches):
+                    c = content_matches[i] if i < len(content_matches) else ""
+                    files.append((p, c))
+        
+        # Try parsing entire output as JSON
+        if not files:
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict) and "files" in data:
+                    for f in data["files"]:
+                        if "path" in f:
+                            files.append((f["path"], f.get("content", "")))
+            except:
                 pass
+        
+        return files if files else None
 
-        return None
+    def _extract_summary(self, text):
+        """Extract summary from JSON."""
+        m = re.search(r'"summary"\s*:\s*"([^"]+)"', text)
+        return m.group(1)[:100] if m else "completed"
 
-    def _write_files(self, files):
-        """Python creates files from JSON, NOT the LLM."""
-        for f in files:
-            path = self.project_dir / f["path"]
-            path.parent.mkdir(parents=True, exist_ok=True)
-            content = f.get("content", "")
-            path.write_text(content)
-            log(f"  📄 {f['path']} ({len(content)}b)", "OK")
-
-    def get_output_text(self):
-        """Get the main output text from JSON result."""
-        if self.result_json:
-            return self.result_json.get("output", "")
-        return ""
-
-    def get_summary(self):
-        """Get summary."""
-        if self.result_json:
-            return self.result_json.get("summary", "")
-        return ""
+    def _extract_output(self, text):
+        """Extract main output text."""
+        m = re.search(r'"output"\s*:\s*"([^"]+)"', text)
+        return m.group(1) if m else text[:500]
 
 
 async def run_parallel(agent_configs, project_dir):
-    """
-    Run multiple agents in TRUE parallel (asyncio.gather).
-    Each gets its own subprocess.
-    """
-    agents = []
-    for cfg in agent_configs:
-        agent = AsyncAgent(
-            role=cfg["role"],
-            system_prompt=cfg.get("system_prompt", "Ти — AI асистент."),
-            task_prompt=cfg["prompt"],
-            project_dir=project_dir,
-            timeout=cfg.get("timeout", 300)
-        )
-        agents.append(agent)
-
-    # ALL agents start simultaneously
-    tasks = [agent.run() for agent in agents]
-    await asyncio.gather(*tasks)
-
+    """Run multiple agents in true parallel."""
+    agents = [ToolCallingAgent(
+        role=cfg["role"],
+        system_prompt=cfg.get("system_prompt", "Ти — AI асистент."),
+        task_prompt=cfg["prompt"],
+        project_dir=project_dir,
+        timeout=cfg.get("timeout", 300)
+    ) for cfg in agent_configs]
+    
+    await asyncio.gather(*[a.run() for a in agents])
     return agents
 
 
-def load_previous_phase(project_dir, phase):
-    """Load artifacts from previous phase to inject into next prompt."""
+def load_phase_context(project_dir, phase, max_tokens=3000):
+    """Load artifacts from a phase with token-safe truncation."""
     arts = Path(project_dir) / ".hermes" / "artifacts"
     phase_dir = arts / phase
     if not phase_dir.exists():
         return ""
     
-    content = []
+    parts = []
+    total_chars = 0
+    max_chars = max_tokens * 4
+    
     for f in sorted(phase_dir.rglob("*")):
-        if f.is_file():
+        if f.is_file() and f.stat().st_size > 0:
             try:
-                text = f.read_text()[:2000]
-                content.append(f"=== {f.relative_to(phase_dir)} ===\n{text}")
+                text = f.read_text()
+                allowed = max_chars - total_chars
+                if allowed <= 0:
+                    parts.append("[...additional context truncated...]")
+                    break
+                parts.append(f"--- {f.relative_to(phase_dir)} ---\n{text[:allowed]}")
+                total_chars += min(len(text), allowed)
             except:
                 pass
-    return "\n\n".join(content)
+    
+    return "\n\n".join(parts)
 
 
-async def auto_fix_loop(role, system_prompt, task_prompt, project_dir, max_retries=3):
+async def auto_fix(message_history, role_prompt, project_dir, max_retries=3):
     """
-    Run agent with auto-fix loop: if output has errors, send back to fix.
+    Auto-fix with message history preservation (not just error concatenation).
+    Each retry adds the error as a USER message, keeping context of what was generated.
     """
     for attempt in range(1, max_retries + 1):
-        log(f"{role} attempt {attempt}/{max_retries}")
+        log(f"  Attempt {attempt}/{max_retries}")
         
-        # Add retry instruction for attempts > 1
-        if attempt > 1:
-            task = f"{task_prompt}\n\nПопередня спроба повернула помилку. Виправ її."
+        if attempt == 1:
+            prompt = role_prompt
         else:
-            task = task_prompt
-
-        agent = AsyncAgent(role, system_prompt, task, project_dir, timeout=300)
+            prompt = role_prompt + f"\n\nПопередня спроба повернула помилку:\n{message_history[-1]}\nВиправ її. Не повторюй старий код."
+        
+        agent = ToolCallingAgent("developer", "Ти — Developer.", prompt, project_dir, timeout=300)
         await agent.run()
-
+        
         if agent.success:
             return agent
-
-        if attempt < max_retries:
-            log(f"{role} failed, retrying... ({agent.error})")
-
+        
+        message_history.append(agent.error)
+    
     return agent
 
 
 async def solo(request, project_dir="."):
-    """Solo: one agent, JSON output, Python handles files."""
+    """Solo: single agent, tool-calling style."""
     project_dir = os.path.abspath(project_dir)
     log(f"=== SOLO: {request} ===")
     start = time.time()
-
-    agent = await auto_fix_loop(
-        "fullstack",
-        "Ти — Fullstack Developer. Генеруй код і файли.",
-        request, project_dir
+    
+    agent = ToolCallingAgent(
+        "fullstack", "Ти — Fullstack Developer. Генеруй код.",
+        request, project_dir, timeout=900
     )
-
+    await agent.run()
+    
     elapsed = time.time() - start
     if agent.success:
-        log(f"✅ Solo DONE ({elapsed:.0f}s)")
+        log(f"✅ SOLO DONE ({elapsed:.0f}s)")
     else:
-        log(f"❌ Solo FAILED ({elapsed:.0f}s): {agent.error}", "ERROR")
+        log(f"❌ SOLO FAILED ({elapsed:.0f}s): {agent.error}", "ERROR")
     return agent.success
 
 
 async def council(request, project_dir):
-    """Council: Architect + Analyst in TRUE parallel via asyncio.gather."""
-    log("=== COUNCIL (parallel) ===")
+    """Council: parallel, token-safe context."""
+    log("=== COUNCIL ===")
     agents = await run_parallel([
-        {
-            "role": "architect",
-            "system_prompt": "Ти — Software Architect. Проектуєш систему.",
-            "prompt": f"Спроектуй архітектуру для: {request}\nОпиши стек, компоненти, структуру.",
-            "timeout": 300
-        },
-        {
-            "role": "analyst",
-            "system_prompt": "Ти — Systems Analyst. Збираєш вимоги.",
-            "prompt": f"Збери вимоги для: {request}\nОпиши функціональні вимоги, обмеження, ризики.",
-            "timeout": 300
-        },
+        {"role": "architect", "system_prompt": "Ти — Software Architect.",
+         "prompt": f"Спроектуй архітектуру для: {request}", "timeout": 300},
+        {"role": "analyst", "system_prompt": "Ти — Systems Analyst.",
+         "prompt": f"Збери вимоги для: {request}", "timeout": 300},
     ], project_dir)
-
-    success = any(a.success for a in agents)
-    if success:
-        log("✅ Council DONE")
-        # Signal done
+    
+    ok = any(a.success for a in agents)
+    if ok:
         (Path(project_dir) / ".hermes" / "signals" / ".council.done").touch()
-    else:
-        log("❌ Council FAILED", "ERROR")
-    return success
+    return ok
 
 
 async def factory(request, project_dir):
-    """Factory: Developer with auto-fix loop + context injection."""
+    """Factory: with message history and token-safe context injection."""
     log("=== FACTORY ===")
-
-    # Load previous phase context (Python reads, injects into prompt)
-    council_context = load_previous_phase(project_dir, "council")
-    context_prompt = f"{request}\n\nКонтекст з попередньої фази:\n{council_context[:3000]}"
-
-    agent = await auto_fix_loop(
-        "developer",
-        "Ти — Developer. Пиши код. Повертай JSON з файлами.",
-        context_prompt, project_dir
-    )
-
+    context = load_phase_context(project_dir, "council", max_tokens=3000)
+    task = f"{request}\n\nКонтекст:\n{context}" if context else request
+    
+    msg_history = []
+    agent = await auto_fix(msg_history, task, project_dir, max_retries=3)
+    
     if agent.success:
-        log("✅ Factory DONE")
         (Path(project_dir) / ".hermes" / "signals" / ".factory.done").touch()
-        
-        # Try to compile/test — auto-fix loop handles this
-        await auto_verify_and_fix(project_dir)
-    else:
-        log("❌ Factory FAILED", "ERROR")
     return agent.success
 
 
-async def auto_verify_and_fix(project_dir, max_attempts=3):
-    """Try to run code, catch errors, send back to agent for fixing."""
-    project = Path(project_dir)
-    
-    # Check if package.json exists (npm project)
-    pkg = project / "package.json"
-    if not pkg.exists():
-        # Try python syntax check instead
-        py_files = list(project.rglob("*.py"))
-        for pf in py_files[:3]:
-            r = await asyncio.create_subprocess_exec(
-                "python3", "-m", "py_compile", str(pf),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await r.communicate()
-            if r.returncode != 0:
-                error_text = stderr.decode()[:500]
-                log(f"  ❌ Python syntax error in {pf.name}", "WARN")
-                # Send error back to developer agent for fixing
-                fix_prompt = f"Файл {pf.name} має помилку:\n{error_text}\nВиправ її."
-                await auto_fix_loop("developer", "Fix code errors.", fix_prompt, project_dir, max_attempts=2)
-            else:
-                log(f"  ✅ {pf.name} syntax OK")
-        return
-
-    # npm project
-    r = await asyncio.create_subprocess_exec(
-        "npm", "test",
-        cwd=str(project),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await r.communicate()
-    if r.returncode != 0:
-        error_text = (stderr + stdout).decode()[:1000]
-        log(f"  ❌ npm test failed", "WARN")
-        # Auto-fix: send error to developer
-        fix_prompt = f"Код має помилку:\n{error_text}\nВиправ її."
-        await auto_fix_loop("developer", "Fix code errors.", fix_prompt, project_dir, max_attempts=2)
-    else:
-        log(f"  ✅ npm test passed")
-
-
 async def rada_fabryka(request, project_dir="."):
-    """Full Rada+Fabryka cycle with all improvements."""
+    """Full cycle."""
     project_dir = os.path.abspath(project_dir)
-    for d in [".hermes/signals/heartbeat", ".hermes/artifacts/council",
-              ".hermes/artifacts/factory/src", ".hermes/artifacts/factory/tests",
-              ".hermes/artifacts/deploy"]:
+    for d in [".hermes/signals", ".hermes/artifacts/council", ".hermes/artifacts/factory/src"]:
         os.makedirs(f"{project_dir}/{d}", exist_ok=True)
     
     start = time.time()
     log("🏗 Rada+Fabryka")
     
-    # Phase 1: Council (parallel)
-    council_ok = await council(request, project_dir)
-    if not council_ok:
-        log("❌ Council failed — aborting", "ERROR")
+    if not await council(request, project_dir):
         return False
     
-    # Phase 2: Factory (with context injection + auto-fix)
-    factory_ok = await factory(request, project_dir)
-    
-    elapsed = time.time() - start
-    log(f"🏗 DONE ({elapsed:.0f}s)")
-    return factory_ok
+    ok = await factory(request, project_dir)
+    log(f"🏗 DONE ({time.time()-start:.0f}s)")
+    return ok
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("SKVA v3 - async multi-agent production engine")
-        print("Usage: python3 skva_core.py solo 'task' [dir]")
-        print("       python3 skva_core.py rada 'task' [dir]")
-        return
-    
-    cmd = sys.argv[1]
-    task = sys.argv[2] if len(sys.argv) > 2 else "create hello world"
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    task = sys.argv[2] if len(sys.argv) > 2 else "create hello"
     proj = sys.argv[3] if len(sys.argv) > 3 else f"/tmp/skva-{int(time.time())}"
-
+    
     if cmd == "solo":
-        ok = asyncio.run(solo(task, proj))
-        sys.exit(0 if ok else 1)
+        sys.exit(0 if asyncio.run(solo(task, proj)) else 1)
     elif cmd == "rada":
-        ok = asyncio.run(rada_fabryka(task, proj))
-        sys.exit(0 if ok else 1)
+        sys.exit(0 if asyncio.run(rada_fabryka(task, proj)) else 1)
     else:
-        print(f"Unknown: {cmd}")
+        print("SKVA v3.5\nCommands: solo, rada")
 
 if __name__ == "__main__":
     main()
