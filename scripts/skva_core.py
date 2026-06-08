@@ -2408,7 +2408,7 @@ async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
         try:
             results = await asyncio.wait_for(
                 asyncio.gather(*[chunker.summarize_chunk(c, i+j, len(chunks)) for j, c in enumerate(batch)]),
-                timeout=120
+                timeout=60
             )
             summaries.extend(results)
         except asyncio.TimeoutError:
@@ -2439,27 +2439,56 @@ async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
     
     async def dev(mod):
         async with sem:
-            # Prepare module-specific context from TZ
-            snip_lines = [l[:200] for l in tz.split('\n') if mod["name"] in l.lower()[:80]]
-            snip = "\n".join(snip_lines[:15]) or str(mod.get("features", ""))
+            # A) Section-based context extraction
+            mod_name = mod["name"].lower()
+            snip = ""
+            lines = tz.split("\n")
+            in_section = False
+            section_lines = []
+            for i, line in enumerate(lines):
+                is_header = line.startswith("## ") or line.startswith("# ")
+                if is_header:
+                    if in_section:
+                        break  # Next section started
+                    if mod_name in line.lower():
+                        in_section = True
+                        section_lines = [line]
+                elif in_section:
+                    section_lines.append(line)
+            if section_lines:
+                snip = "\n".join(section_lines)[:3000]
+            if not snip:
+                snip = str(mod.get("features", ""))
             
             for retry in range(2):
+                # C) Timeout: 180s → 90s
                 p = f"Implement '{mod['name']}'. Complete HTML+CSS+JS inline. Dark theme, mobile, self-contained. CONTEXT: {ctx[:5000]} SPEC: {snip[:2500]}"
                 try:
-                    r, it, ot = await asyncio.wait_for(gonka_call(p, timeout=180), timeout=200)
+                    r, it, ot = await asyncio.wait_for(gonka_call(p, timeout=90), timeout=100)
                 except (asyncio.TimeoutError, Exception) as e:
                     log(f"  {mod['name']} attempt {retry+1} failed: {str(e)[:60]}", "WARN")
                     continue
                 
+                # B) Two-pass parser: filepath blocks → ```html blocks → full response
                 files = {}
+                # Pass 1: // filepath: blocks
                 for m in re.finditer(r"// filepath:\s*(.+?)\n(.*?)(?=```|// filepath:|\Z)", r or "", re.DOTALL):
                     path = m.group(1).strip()
-                    content = m.group(2)
-                    if len(content) > 50:  # Quality gate: skip stubs
+                    content = m.group(2).strip()
+                    if len(content) > 50:
                         files[path] = content
-                
+                # Pass 2: ```html blocks (fallback)
+                if not files:
+                    for m in re.finditer(r"```html\n(.*?)```", r or "", re.DOTALL):
+                        content = m.group(1).strip()
+                        if len(content) > 50:
+                            files[f"{mod['name']}.html"] = content
+                # Pass 3: full response as last resort
                 if not files and r and len(r) > 100:
-                    files[f"{mod['name']}.html"] = r
+                    # Strip markdown code fences if present
+                    clean = re.sub(r"^```.*\n?", "", r.strip())
+                    clean = re.sub(r"\n```$", "", clean)
+                    files[f"{mod['name']}.html"] = clean
             
                 if files:
                     return {"name": mod["name"], "files": files, "tok": it + ot, "retries": retry}
