@@ -126,9 +126,13 @@ def cmd_test():
     assert should_patch("", "new content") == False  # new file
     assert should_patch("a\nb\nc", "a\nb\nc\n") == True  # small change
     assert parse_search_replace_blocks("<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE") == [("old", "new")]
-    result = apply_search_replace("hello old world", [("old", "new")])
+    result, ok = apply_search_replace("hello old world", [("old", "new")])
     assert result == "hello new world", f"Got: {result}"
-    print("   ✅ SEARCH/REPLACE: parse + apply + should_patch")
+    assert ok == True
+    # Test failed patch
+    result2, ok2 = apply_search_replace("hello world", [("missing", "new")])
+    assert ok2 == False
+    print("   ✅ SEARCH/REPLACE: parse + apply + should_patch + failure detection")
     tests += 1; passed += 1
     
     # 5. Resource Balancing

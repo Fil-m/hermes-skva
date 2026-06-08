@@ -242,22 +242,29 @@ def should_patch(old_content: str, new_content: str) -> bool:
     return len(old_lines) < 200 and change_ratio < 0.3
 
 
-def apply_search_replace(content: str, search_replace_blocks: List[tuple]) -> str:
+def apply_search_replace(content: str, search_replace_blocks: List[tuple]) -> tuple:
     """
     Apply SEARCH/REPLACE blocks à la Aider.
     Each block: (SEARCH_text, REPLACE_text)
-    Returns patched content.
+    Returns (patched_content, success). If any block fails to match,
+    success=False and original content is returned.
     """
     result = content
     for search, replace in search_replace_blocks:
+        applied = False
         if search in result:
             result = result.replace(search, replace, 1)
+            applied = True
         else:
             # Fuzzy fallback: try stripped version
             search_stripped = search.strip()
             if search_stripped in result:
                 result = result.replace(search_stripped, replace.strip(), 1)
-    return result
+                applied = True
+        if not applied:
+            log(f"  ⚠️ SEARCH block not found in file: {search[:60]}...", "WARN")
+            return content, False
+    return result, True
 
 
 def parse_search_replace_blocks(text: str) -> List[tuple]:
@@ -616,18 +623,24 @@ class MarkdownAgent:
 {retry_context}
 
 ВАЖЛИВО — формат відповіді:
-Для КОЖНОГО файлу, який треба створити:
+
+Для КОЖНОГО файлу (нового чи існуючого) обов'язково починай з файлового шляху:
+
 ```language
 // filepath: relative/path/file.ext
-// content
+... код ...
 ```
 
-Якщо ТРЕБА ВІДРЕДАГУВАТИ існуючий файл, використовуй SEARCH/REPLACE:
+Якщо це РЕДАГУВАННЯ існуючого файлу, використовуй SEARCH/REPLACE ВСЕРЕДИНІ блоку з filepath:
+
+```language
+// filepath: relative/path/file.ext
 <<<<<<< SEARCH
 старий код
 =======
 новий код
 >>>>>>> REPLACE
+```
 
 Наприкінці напиши короткий підсумок."""
 
@@ -703,7 +716,11 @@ class MarkdownAgent:
                 if inner_sr and check_path.exists():
                     # Apply as patch to existing file (from work_dir context)
                     old_content = check_path.read_text()
-                    patched = apply_search_replace(old_content, inner_sr)
+                    patched, patch_ok = apply_search_replace(old_content, inner_sr)
+                    if not patch_ok:
+                        log(f"  ⚠️ Patch failed for {path}, retrying with full rewrite", "WARN")
+                        self.error = f"Patch not applied: SEARCH block not found"
+                        self.error_code = ErrorCode.MALFORMED
                     full_path.write_text(patched)
                     patch_count += len(inner_sr)
                     written_paths.append(f"{path} (patch)")
@@ -850,7 +867,8 @@ async def run_node(node: Node, sm: StateMachine, request: str,
     elif node.type == NodeType.REVIEW:
         agent = MarkdownAgent(
             "qa", "Ти — QA Engineer. Перевір код на помилки.",
-            f"Проведи code review. Знайди мінімум 3 проблеми:\n{task}",
+            f"Проведи code review. Знайди мінімум 3 проблеми:\n{task}\n"
+            f"Наприкінці напиши СТАТУС: ПОМИЛКА або СТАТУС: УСПІШНО",
             project_dir, timeout=300
         )
         await agent.run()
@@ -880,6 +898,12 @@ async def run_node(node: Node, sm: StateMachine, request: str,
         await agents[0].run()
 
     success = any(a.success for a in agents)
+    # REVIEW node: parse QA verdict, don't trust agent.success alone
+    if node.type == NodeType.REVIEW and success:
+        review_raw = agents[0].raw_output.upper()
+        if "СТАТУС: ПОМИЛКА" in review_raw or "STATUS: FAIL" in review_raw:
+            success = False
+            log(f"  🔄 QA found issues, routing to fix branch")
     errors = [a.error for a in agents if not a.success]
     error_code = None
     if errors:
