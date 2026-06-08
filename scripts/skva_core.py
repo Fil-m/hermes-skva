@@ -2268,7 +2268,13 @@ async def run_parallel(configs, project_dir):
         timeout=cfg.get("timeout", 300),
         model=cfg.get("model", "")
     ) for cfg in configs]
-    await asyncio.gather(*[a.run() for a in agents])
+    try:
+        await asyncio.wait_for(asyncio.gather(*[a.run() for a in agents]), timeout=600)
+    except asyncio.TimeoutError:
+        print("SKVA-AUTO: Agent execution timed out after 600 seconds, cancelling tasks...")
+        for task in asyncio.all_tasks():
+            task.cancel()
+        await asyncio.gather(*[t for t in asyncio.all_tasks() if t is not asyncio.current_task()], return_exceptions=True)
     return agents
 
 

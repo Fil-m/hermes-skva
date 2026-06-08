@@ -1575,7 +1575,7 @@ new code
         patched = content.replace(old, new, 1)
         try:
             compile(patched, 'skva_core.py', 'exec')
-            log(f"  ✅ Patch validation: syntax OK")
+            log(f"  Patch validation: syntax OK")
             return True
         except SyntaxError as e:
             log(f"  Patch validation FAILED: {e}", "WARN")
