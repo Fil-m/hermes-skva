@@ -15,10 +15,16 @@ curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scri
 
 # 2. Встановити SKVA
 git clone https://github.com/Fil-m/hermes-skva.git ~/.hermes-skva
-cd ~/.hermes-skva
-bash install.sh
+bash ~/.hermes-skva/install.sh
+source ~/.bashrc
 
-# 3. Запустити
+# 3. Перевірити
+skva doctor
+
+# 4. Запустити Solo
+skva solo "створи index.html з Hello World" /tmp/my-first-project
+
+# 5. Або через Hermes (повний цикл)
 hermes --skills skva-orchestrator
 ```
 
