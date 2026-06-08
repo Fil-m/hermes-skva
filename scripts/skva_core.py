@@ -2385,63 +2385,155 @@ async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
     import time as _t
     project_dir = os.path.abspath(project_dir)
     start = _t.time()
-    with open(tz_path) as f:
-        tz = f.read()
+    
+    # 1. Read TZ
+    try:
+        with open(tz_path) as f:
+            tz = f.read()
+    except (FileNotFoundError, OSError) as e:
+        log(f"TZ not found: {e}", "ERROR")
+        return False
+    if len(tz) < 100:
+        log(f"TZ too small: {len(tz)} chars", "ERROR")
+        return False
     log(f"TZ: {len(tz)} chars")
+    
+    # 2. Chunk + summarize with timeout per batch
     chunker = DocumentChunker()
     chunks = chunker.split(tz)
     log(f"Chunks: {len(chunks)}")
     summaries = []
     for i in range(0, len(chunks), 3):
         batch = chunks[i:i+3]
-        results = await asyncio.gather(*[
-            chunker.summarize_chunk(c, i+j, len(chunks)) for j, c in enumerate(batch)
-        ])
-        summaries.extend(results)
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*[chunker.summarize_chunk(c, i+j, len(chunks)) for j, c in enumerate(batch)]),
+                timeout=120
+            )
+            summaries.extend(results)
+        except asyncio.TimeoutError:
+            log(f"  Chunk batch {i//3+1} timed out, using partial context", "WARN")
+            summaries.extend([f"[Chunk {i+j+1} — timed out]" for j in range(len(batch))])
     ctx = "\n".join(summaries)
     log(f"Context: {len(ctx)} chars")
-    ap = f'Break spec into modules. JSON only: {{"modules":[{{"name":"editor","features":[]}}]}} CONTEXT: {ctx[:18000]}'
-    resp, _, _ = await gonka_call(ap, timeout=90)
+    
+    # 3. Module analysis with retry
     modules = []
-    try:
-        jm = re.search(r'\{.*"modules":.*?\}', resp or "", re.DOTALL)
-        if jm: modules = json.loads(jm.group(0)).get("modules", [])
-    except: pass
+    for attempt in range(2):
+        ap = f'Break this spec into independent modules. JSON only: {{"modules":[{{"name":"editor","features":["grid","colors"]}}]}} CONTEXT: {ctx[:18000]}'
+        resp, _, _ = await gonka_call(ap, timeout=90)
+        try:
+            jm = re.search(r'\{.*"modules":.*?\}', resp or "", re.DOTALL)
+            if jm:
+                modules = json.loads(jm.group(0)).get("modules", [])
+                if modules:
+                    break
+        except: pass
     if not modules:
         modules = [{"name": n, "features": [v["desc"]]} for n, v in FACTORY_MODULES.items()]
+        log(f"Using fallback modules ({len(modules)})")
     log(f"Modules: {[m['name'] for m in modules]}")
+    
+    # 4. Parallel development with timeout + retry + quality gates
     sem = asyncio.Semaphore(3)
+    
     async def dev(mod):
         async with sem:
-            snip = "\n".join(l[:200] for l in tz.split('\n') if mod["name"] in l.lower()[:80]) or str(mod.get("features",""))
-            p = f"Implement '{mod['name']}'. Complete HTML+CSS+JS inline. Dark theme, mobile. CONTEXT: {ctx[:5000]} SPEC: {snip[:2500]}"
-            r, it, ot = await gonka_call(p, timeout=180)
-            files = {}
-            for m in re.finditer(r"// filepath:\s*(.+?)\n(.*?)(?=```|// filepath:|\Z)", r or "", re.DOTALL):
-                files[m.group(1).strip()] = m.group(2)
-            if not files and r:
-                files[f"{mod['name']}.html"] = r[:30000]
-            return {"name": mod["name"], "files": files, "tok": it + ot}
-    results = await asyncio.gather(*[dev(m) for m in modules])
+            # Prepare module-specific context from TZ
+            snip_lines = [l[:200] for l in tz.split('\n') if mod["name"] in l.lower()[:80]]
+            snip = "\n".join(snip_lines[:15]) or str(mod.get("features", ""))
+            
+            for retry in range(2):
+                p = f"Implement '{mod['name']}'. Complete HTML+CSS+JS inline. Dark theme, mobile, self-contained. CONTEXT: {ctx[:5000]} SPEC: {snip[:2500]}"
+                try:
+                    r, it, ot = await asyncio.wait_for(gonka_call(p, timeout=180), timeout=200)
+                except (asyncio.TimeoutError, Exception) as e:
+                    log(f"  {mod['name']} attempt {retry+1} failed: {str(e)[:60]}", "WARN")
+                    continue
+                
+                files = {}
+                for m in re.finditer(r"// filepath:\s*(.+?)\n(.*?)(?=```|// filepath:|\Z)", r or "", re.DOTALL):
+                    path = m.group(1).strip()
+                    content = m.group(2)
+                    if len(content) > 50:  # Quality gate: skip stubs
+                        files[path] = content
+                
+                if not files and r and len(r) > 100:
+                    files[f"{mod['name']}.html"] = r
+            
+                if files:
+                    return {"name": mod["name"], "files": files, "tok": it + ot, "retries": retry}
+            
+            return {"name": mod["name"], "files": {}, "tok": 0, "retries": 2, "failed": True}
+    
+    results = await asyncio.gather(*[dev(m) for m in modules], return_exceptions=True)
+    
+    # 5. Collect files with duplicate protection
     all_files = {}
+    file_source = {}  # Track which module produced each file
     for r in results:
+        if isinstance(r, Exception):
+            log(f"  Module exception: {r}", "WARN")
+            continue
         for p, c in r.get("files", {}).items():
+            if p in all_files:
+                log(f"  ⚠️ Duplicate {p}, keeping from {file_source[p]}", "WARN")
+                continue
             all_files[p] = c
-        log(f"  {r['name']}: {len(r.get('files',{}))} files, {r.get('tok',0)} tok")
-    ip = f"Create index.html integrating: {list(all_files.keys())}. Dark hub with tab nav."
-    ir, _, _ = await gonka_call(ip, timeout=90)
-    for m in re.finditer(r"```html\n(.*?)```", ir or "", re.DOTALL):
-        all_files["index.html"] = m.group(1)
-        break
+            file_source[p] = r["name"]
+        status = "❌" if r.get("failed") else "✅"
+        log(f"  {status} {r['name']}: {len(r.get('files',{}))} files, {r.get('tok',0)} tok{' (retry)' if r.get('retries',0)>0 else ''}")
+    
+    if not all_files:
+        log("No files generated by any module!", "ERROR")
+        return False
+    
+    # 6. Integration: create index.html with fallback
+    ip = f"Create index.html for Habitat OS. Integrate: {list(all_files.keys())}. Dark hub with tab navigation, header bar."
+    try:
+        ir, _, _ = await asyncio.wait_for(gonka_call(ip, timeout=90), timeout=100)
+        for m in re.finditer(r"```html\n(.*?)```", ir or "", re.DOTALL):
+            all_files["index.html"] = m.group(1)
+            break
+    except asyncio.TimeoutError:
+        log("Integration timed out, using fallback index", "WARN")
+    
+    # Fallback index.html if integration failed
+    if "index.html" not in all_files:
+        module_links = "\n".join(f'    <li><a href="{p}">{p}</a></li>' for p in sorted(all_files.keys()))
+        all_files["index.html"] = f"""<!DOCTYPE html>
+<html lang="uk"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Habitat OS</title><style>body{{background:#0a0e1a;color:#e0e0e0;font-family:sans-serif;padding:20px}}
+a{{color:#64b5f6}}h1{{text-align:center;color:#90caf9}}</style></head><body>
+<h1>⬡ Habitat OS</h1><ul>{module_links}</ul></body></html>"""
+    
+    # 7. Write all files with error handling
     pd = Path(project_dir)
     pd.mkdir(parents=True, exist_ok=True)
-    c = 0
+    count = 0
+    written = []
     for p, content in all_files.items():
-        (pd / p).parent.mkdir(parents=True, exist_ok=True)
-        (pd / p).write_text(content)
-        c += 1
-    log(f"FACTORY: {_t.time()-start:.0f}s, {c} files, ~{sum(r.get('tok',0) for r in results)} tok")
-    return True
+        try:
+            fp = pd / p
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(content)
+            written.append(p)
+            count += 1
+        except OSError as e:
+            log(f"  Write failed: {p} — {e}", "WARN")
+    
+    elapsed = _t.time() - start
+    total_tok = sum(r.get("tok", 0) for r in results if isinstance(r, dict))
+    failed = sum(1 for r in results if isinstance(r, Exception) or (isinstance(r, dict) and r.get("failed")))
+    
+    log(f"\n{'='*50}")
+    log(f"FACTORY: {elapsed:.0f}s")
+    log(f"📄 Files: {count} ({', '.join(written[:6])}{'...' if len(written)>6 else ''})")
+    log(f"🤖 Agents: {len(modules)} dev + 1 analysis + {len(chunks)} chunk + 1 integration")
+    log(f"💰 Tokens: ~{total_tok}")
+    log(f"⚠️  Failures: {failed}/{len(modules)} modules")
+    log(f"{'✅' if failed == 0 else '⚠️'} Done — {'all modules OK' if failed == 0 else f'{failed} module(s) failed'}")
+    return failed < len(modules)
 
 
 def main():
