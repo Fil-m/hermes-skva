@@ -583,6 +583,7 @@ class MarkdownAgent:
         self.summary = ""
         self.raw_output = ""
         self.secure_workspace = secure_workspace
+        self.model = model
 
         # Token-aware retry context
         retry_context = ""
@@ -638,13 +639,19 @@ class MarkdownAgent:
             else self.project_dir / ".hermes" / "artifacts" / self.role
         work_dir.mkdir(parents=True, exist_ok=True)
 
+        # Build env with optional model override
+        env = {**os.environ, "HERMES_HOME": HERMES_HOME,
+               "SKVA_WORK_DIR": str(work_dir)}
+        if self.model:
+            env["HERMES_INFERENCE_MODEL"] = self.model
+            log(f"  model: {self.model}")
+
         proc = await asyncio.create_subprocess_exec(
             "hermes", "chat", "-q", self.full_prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             preexec_fn=limit_resources if sys.platform != "win32" else None,
-            env={**os.environ, "HERMES_HOME": HERMES_HOME,
-                 "SKVA_WORK_DIR": str(work_dir)}
+            env=env
         )
 
         output_lines = []
@@ -759,7 +766,7 @@ def _build_retry_context(files_dict, error_msg, budget=4000):
 
 
 async def auto_fix(role, task_prompt, project_dir, max_retries=3,
-                   secure_workspace=None):
+                   secure_workspace=None, model=""):
     """Auto-fix with error taxonomy and retry strategies."""
     previous_code = ""
     previous_error = ""
@@ -771,7 +778,8 @@ async def auto_fix(role, task_prompt, project_dir, max_retries=3,
             role, "Ти — Developer. Пиши код.",
             task_prompt, project_dir, timeout=300,
             previous_code=previous_code, previous_error=previous_error,
-            secure_workspace=secure_workspace
+            secure_workspace=secure_workspace,
+            model=model
         )
         await agent.run()
 
@@ -816,18 +824,20 @@ async def run_node(node: Node, sm: StateMachine, request: str,
     if node.type == NodeType.ANALYZE:
         agents = await run_parallel([
             {"role": "analyst", "system_prompt": "Ти — Systems Analyst.",
-             "prompt": f"Збери вимоги для: {task}", "timeout": 300},
+             "prompt": f"Збери вимоги для: {task}", "timeout": 300,
+             "model": node.model},
         ], project_dir)
     elif node.type == NodeType.DESIGN:
         agents = await run_parallel([
             {"role": "architect", "system_prompt": "Ти — Software Architect.",
-             "prompt": f"Спроектуй архітектуру для: {task}", "timeout": 300},
+             "prompt": f"Спроектуй архітектуру для: {task}", "timeout": 300,
+             "model": node.model},
         ], project_dir)
     elif node.type == NodeType.IMPLEMENT:
         with SecureWorkspace(prefix=f"skva_{node.id}_") as ws:
             ws.seed_from_project(project_dir)
             agent = await auto_fix("developer", task, project_dir,
-                                   secure_workspace=ws)
+                                   secure_workspace=ws, model=node.model)
             # Copy CLEAN files from output_dir to project
             if agent.success and agent.files:
                 for path in agent.files.keys():
@@ -850,7 +860,7 @@ async def run_node(node: Node, sm: StateMachine, request: str,
             ws.seed_from_project(project_dir)
             agent = await auto_fix("developer", f"ВИПРАВ ПОМИЛКИ:\n{task}",
                                    project_dir, max_retries=2,
-                                   secure_workspace=ws)
+                                   secure_workspace=ws, model=node.model)
             if agent.success and agent.files:
                 for path in agent.files.keys():
                     src = ws.output_dir / path
@@ -862,7 +872,8 @@ async def run_node(node: Node, sm: StateMachine, request: str,
     elif node.type == NodeType.DEPLOY:
         agents = await run_parallel([
             {"role": "fullstack", "system_prompt": "Ти — DevOps.",
-             "prompt": f"Фіналізуй проект:\n{task}", "timeout": 300},
+             "prompt": f"Фіналізуй проект:\n{task}", "timeout": 300,
+             "model": node.model},
         ], project_dir)
     else:
         agents = [MarkdownAgent(node.role, node.system_prompt, task, project_dir)]
@@ -1093,7 +1104,8 @@ async def run_parallel(configs, project_dir):
         system_prompt=cfg.get("system_prompt", "Ти — AI асистент."),
         task_prompt=cfg["prompt"],
         project_dir=project_dir,
-        timeout=cfg.get("timeout", 300)
+        timeout=cfg.get("timeout", 300),
+        model=cfg.get("model", "")
     ) for cfg in configs]
     await asyncio.gather(*[a.run() for a in agents])
     return agents
