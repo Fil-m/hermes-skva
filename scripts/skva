@@ -172,6 +172,11 @@ def main():
         print("  skva doctor             — діагностика")
         print("  skva test               — smoke test")
         print()
+        print("Ретро:")
+        print("  skva discover [запит]   — пошук скілів на GitHub")
+        print("  skva import  <url>      — імпорт скілу з GitHub")
+        print("  skva skills             — список локальних скілів")
+        print()
         print("Приклад:")
         print("  skva solo \"створи index.html\" /tmp/my-project")
         return
@@ -189,6 +194,35 @@ def main():
         cmd_doctor()
     elif cmd == "test":
         cmd_test()
+    elif cmd == "discover":
+        import asyncio
+        from skva_core import discover_skills
+        query = sys.argv[2] if len(sys.argv) > 2 else "skva"
+        results = asyncio.run(discover_skills(query))
+        if not results:
+            print("Не знайдено скілів")
+        else:
+            print(f"\nЗнайдено {len(results)} скілів:\n")
+            for r in results:
+                print(f"  {r['name']} — {r['source']}")
+                print(f"     {r['url']}\n")
+    elif cmd == "import":
+        if len(sys.argv) < 3:
+            print("❌ Вкажи URL скілу: skva import <url>")
+        else:
+            import asyncio
+            from skva_core import import_skill
+            ok = asyncio.run(import_skill(sys.argv[2], os.getcwd()))
+            print(f"{'✅' if ok else '❌'} Імпорт {'успішний' if ok else 'не вдався'}")
+    elif cmd == "skills":
+        from skva_core import list_skills
+        skills = list_skills(os.getcwd())
+        if not skills:
+            print("Локальних скілів не знайдено")
+        else:
+            print(f"\nЛокальні скіли ({len(skills)}):\n")
+            for s in skills:
+                print(f"  {s['name']} — {s['desc']} ({s['size']}b)")
     else:
         print(f"Невідома команда: {cmd}")
         print("Команди: solo, rada, agile, pipeline, dag, doctor, test")

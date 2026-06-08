@@ -282,6 +282,137 @@ class NodeType(Enum):
     ERROR = "error"
 
 
+# ═══════════════════════════════════════════════════
+# RETRO — самонавчання, обмін скілами, Discovery
+# ═══════════════════════════════════════════════════
+
+RETRO_SKILLS_DIR = ".skva/skills"
+RETRO_DATA_DIR = ".skva/retro"
+RETRO_BUDGET_RATIO = 0.10
+SKILL_REGISTRY = ".skva/skills/registry.yaml"
+SKILL_SOURCES = ["Fil-m/hermes-skva"]
+
+
+@dataclass
+class RetroRecord:
+    run_id: str
+    source: str = "auto"
+    skill_name: str = ""
+    skill_content: str = ""
+    error_pattern: str = ""
+    error_action: str = ""
+    tokens_spent: int = 0
+    created_at: float = 0.0
+
+
+def retro_budget(report: RunReport) -> int:
+    total = sum(r.total_tokens for r in report.records) or 10000
+    return max(1000, int(total * RETRO_BUDGET_RATIO))
+
+
+async def run_retro(report: RunReport, project_dir: str) -> RetroRecord:
+    budget = retro_budget(report)
+    total_tok = sum(r.total_tokens for r in report.records)
+    log(f"🔄 Retro: {budget} tok budget (10% of {total_tok})")
+    lines = []
+    for rec in report.records:
+        s = "success" if rec.status == "success" else "failed"
+        lines.append(f"- {rec.role} [{s}] {rec.duration:.0f}s, {rec.files_written} files, {rec.total_tokens} tok"
+                     + (f", err={rec.error_code}: {rec.error_message[:60]}" if rec.error_code else ""))
+    prompt = f"""Analyze this SKVA execution. Find 1-3 improvements.
+
+RUN:
+{' '.join(lines)}
+
+Output YAML:
+```yaml
+errors:
+  - pattern: "..."
+    action: "..."
+skills:
+  - name: "..."
+    content: "---\\nname: ...\\ndescription: ...\\n---\\n..."
+prompts:
+  - node: "..."
+    improvement: "..."
+```"""
+    response, in_tok, out_tok = await gonka_call(prompt, timeout=60)
+    rec = RetroRecord(run_id=str(int(time.time())), source="auto",
+                      tokens_spent=in_tok + out_tok, created_at=time.time())
+    if not response:
+        log("Retro: no response", "WARN")
+        return rec
+    m = re.search(r"name:\s*[\"']?(.+?)[\"']?\n\s*content:\s*[\"']?(.+?)(?:\n\s*\w+:|$)", response, re.DOTALL)
+    if m: rec.skill_name, rec.skill_content = m.group(1).strip(), m.group(2).strip()
+    m = re.search(r"pattern:\s*[\"']?(.+?)[\"']?\n\s*action:\s*[\"']?(.+?)[\"']?", response, re.DOTALL)
+    if m: rec.error_pattern, rec.error_action = m.group(1).strip(), m.group(2).strip()
+
+    retro_dir = Path(project_dir) / RETRO_DATA_DIR
+    retro_dir.mkdir(parents=True, exist_ok=True)
+    (retro_dir / f"{rec.run_id}.yaml").write_text(f"run_id: {rec.run_id}\nsource: {rec.source}\ntokens: {rec.tokens_spent}\nresponse: |\n  {response.replace(chr(10), chr(10)+'  ')}\n")
+
+    if rec.skill_name and rec.skill_content:
+        sd = Path(project_dir) / RETRO_SKILLS_DIR
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / f"{rec.skill_name.lower().replace(' ', '-')}.md").write_text(rec.skill_content)
+        log(f"Retro: skill '{rec.skill_name}' saved")
+    if rec.error_pattern:
+        log(f"Retro: new error pattern '{rec.error_pattern[:60]}' → {rec.error_action[:60]}")
+    c = _gonka_estimate_cost(in_tok, out_tok)
+    log(f"Retro: done ({in_tok}→{out_tok} tok, ~${c:.4f})")
+    return rec
+
+
+async def discover_skills(query: str = "", max_results: int = 10) -> list:
+    results = []
+    for source in SKILL_SOURCES:
+        url = f"https://api.github.com/repos/{source}/contents/{RETRO_SKILLS_DIR}"
+        proc = await asyncio.create_subprocess_exec("curl", "-s", url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0:
+            for f in (json.loads(out.decode()) if isinstance(json.loads(out.decode()), list) else []):
+                if f["name"].endswith(".md"):
+                    results.append({"name": f["name"], "path": f["path"], "url": f["download_url"], "source": source})
+    if query:
+        url = f"https://api.github.com/search/code?q={query}+path:.skva/skills/&per_page={max_results}"
+        proc = await asyncio.create_subprocess_exec("curl", "-s", url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0:
+            for item in json.loads(out.decode()).get("items", []):
+                results.append({"name": item["name"], "path": item["path"], "url": item["html_url"], "source": item["repository"]["full_name"]})
+    return results[:max_results]
+
+
+async def import_skill(url: str, project_dir: str) -> bool:
+    proc = await asyncio.create_subprocess_exec("curl", "-sL", url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    content = out.decode()
+    if not content or len(content) < 50 or not content.startswith("---"):
+        return False
+    nm = re.search(r"^name:\s*(.+)$", content, re.MULTILINE)
+    name = nm.group(1).strip() if nm else Path(url).stem
+    sd = Path(project_dir) / RETRO_SKILLS_DIR
+    sd.mkdir(parents=True, exist_ok=True)
+    fp = sd / f"{name.lower().replace(' ', '-')}.md"
+    if "<!-- imported from:" not in content:
+        content += f"\n<!-- imported from: {url} -->\n"
+    fp.write_text(content)
+    log(f"Imported skill '{name}'")
+    return True
+
+
+def list_skills(project_dir: str) -> list:
+    sd = Path(project_dir) / RETRO_SKILLS_DIR
+    if not sd.exists():
+        return []
+    r = []
+    for f in sorted(sd.glob("*.md")):
+        c = f.read_text()
+        nm = re.search(r"^name:\s*(.+)$", c, re.MULTILINE)
+        ds = re.search(r"^description:\s*(.+)$", c, re.MULTILINE)
+        r.append({"name": nm.group(1).strip() if nm else f.stem, "file": str(f), "desc": ds.group(1).strip() if ds else "", "size": len(c)})
+    return r
+
 @dataclass
 class Node:
     id: str
@@ -747,6 +878,14 @@ async def gonka_call(prompt: str, timeout: int = 300) -> tuple:
         "temperature": 0.2,
     })
 
+    # Write data to temp file to avoid "Argument list too long"
+    import tempfile as _tf
+    data_dir = _tf.mkdtemp(prefix="skva_gonka_")
+    data_file = Path(data_dir) / "data.json"
+    data_file.write_text(data)
+    data_arg = f"@{data_file}"
+    _cleanup = lambda: shutil.rmtree(data_dir, ignore_errors=True)
+
     for attempt in range(4):  # 0, 1, 2, 3 with 1,2,4,8s backoff
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -754,7 +893,7 @@ async def gonka_call(prompt: str, timeout: int = 300) -> tuple:
                 "-X", "POST", GONKA_API,
                 "-H", "Content-Type: application/json",
                 "-H", f"Authorization: Bearer {key}",
-                "-d", data,
+                "-d", data_arg,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -801,9 +940,11 @@ async def gonka_call(prompt: str, timeout: int = 300) -> tuple:
         out_tok = usage.get("completion_tokens", count_tokens(content))
         cost = _gonka_estimate_cost(in_tok, out_tok)
         log(f"Gonka OK: {in_tok}→{out_tok} tok, ~${cost:.6f}")
+        _cleanup()
         return content, in_tok, out_tok
 
     log("Gonka all 4 attempts failed", "ERROR")
+    _cleanup()
     return "", 0, 0
 
 
@@ -1205,7 +1346,10 @@ async def run_node(node: Node, sm: StateMachine, request: str,
                     dst = Path(project_dir) / path
                     if src.exists():
                         dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src, dst)
+                        try:
+                            shutil.copy2(src, dst)
+                        except shutil.SameFileError:
+                            pass  # Same path, already in project
         agents = [agent]
     elif node.type == NodeType.REVIEW:
         agent = MarkdownAgent(
@@ -1228,7 +1372,10 @@ async def run_node(node: Node, sm: StateMachine, request: str,
                     dst = Path(project_dir) / path
                     if src.exists():
                         dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src, dst)
+                        try:
+                            shutil.copy2(src, dst)
+                        except shutil.SameFileError:
+                            pass
         agents = [agent]
     elif node.type == NodeType.DEPLOY:
         agents = await run_parallel([
@@ -1314,6 +1461,9 @@ async def run_dag(workflow_nodes: List[Node], edges: List[tuple],
         ok = await run_node(sm.nodes[start_node], sm, request, project_dir, resources)
         report.end_phase(start_node, "success" if ok else "failure")
         report.print_final_summary()
+
+    # Retro: самонавчання після DAG (10% бюджету)
+    retro_rec = await run_retro(report, project_dir)
 
     log(f"🏁 DAG done ({time.time()-start:.0f}s): {'✅' if ok else '❌'}")
     return ok
