@@ -17,6 +17,129 @@ SKVA_DIR = ".skva"
 
 
 # ═══════════════════════════════════════════════════
+# RUN REPORT — live progress + final statistics
+# ═══════════════════════════════════════════════════
+
+@dataclass
+class RunRecord:
+    node_id: str
+    role: str
+    model: str
+    attempt: int
+    max_retries: int
+    status: str = "running"  # running | success | failed | skipped
+    duration: float = 0.0
+    files_written: int = 0
+    patches_applied: int = 0
+    error_code: str = ""
+    error_message: str = ""
+    started_at: float = 0.0
+
+
+REPORT = None  # Global report instance, set by run_dag
+
+def init_report():
+    global REPORT
+    REPORT = RunReport()
+
+class RunReport:
+    """Tracks all agent runs and produces live + final reports."""
+
+    def __init__(self):
+        self.records: List[RunRecord] = []
+        self.start_time = time.time()
+        self.node_times: Dict[str, float] = {}  # node_id -> total seconds
+        self.last_print = 0.0
+
+    def start_agent(self, node_id: str, role: str, model: str, 
+                    attempt: int, max_retries: int) -> RunRecord:
+        rec = RunRecord(node_id, role, model, attempt, max_retries,
+                        started_at=time.time())
+        self.records.append(rec)
+        self._live(f"  🤖 {role} спроба {attempt}/{max_retries}" + 
+                   (f" [{model}]" if model else ""))
+        return rec
+
+    def complete_agent(self, rec: RunRecord, status: str, duration: float,
+                       files: int = 0, patches: int = 0,
+                       error_code: str = "", error_msg: str = ""):
+        rec.status = status
+        rec.duration = duration
+        rec.files_written = files
+        rec.patches_applied = patches
+        rec.error_code = error_code
+        rec.error_message = error_msg
+        icon = "✅" if status == "success" else "❌" if status == "failed" else "⚠️"
+        self._live(f"  {icon} {rec.role} ({duration:.0f}с)"
+                   + (f" — {files} файлів, {patches} патчів" if files or patches else "")
+                   + (f" [{error_code}]" if error_code else ""))
+
+    def start_phase(self, node_id: str, node_type: str):
+        icons = {"analyze": "🔍", "design": "🎨", "implement": "💻",
+                 "review": "👁", "fix": "🔧", "deploy": "🚀",
+                 "done": "✅", "error": "❌"}
+        icon = icons.get(node_type, "🏗")
+        self._live(f"\n{icon} Фаза: {node_type} ({node_id})")
+        self.node_times[node_id] = time.time()
+
+    def end_phase(self, node_id: str, status: str):
+        elapsed = time.time() - self.node_times.get(node_id, time.time())
+        status_icon = "✅" if status == "success" else "❌"
+        self._live(f"  {status_icon} Фаза завершена за {elapsed:.0f}с")
+
+    def phase_error(self, node_id: str, error_code: str, error_msg: str):
+        self._live(f"  ⚠️ Помилка: [{error_code}] {error_msg[:120]}")
+
+    def resource_status(self, capacity: int, active: int):
+        now = time.time()
+        if now - self.last_print < 30:  # Throttle: every 30s
+            return
+        self.last_print = now
+        elapsed = now - self.start_time
+        self._live(f"  ⚡ Ресурси: {active} активних, максимум {capacity} | ⏱ {elapsed:.0f}с")
+
+    def print_final_summary(self):
+        elapsed = time.time() - self.start_time
+        total_agents = len(self.records)
+        success_agents = sum(1 for r in self.records if r.status == "success")
+        failed_agents = sum(1 for r in self.records if r.status == "failed")
+        total_files = sum(r.files_written for r in self.records)
+        total_retries = sum(1 for r in self.records if r.attempt > 1)
+
+        print("\n" + "═" * 55)
+        print("📊  ЗВІТ ПРО ВИКОНАННЯ")
+        print("═" * 55)
+        print(f"⏱  Загальний час:    {elapsed:.0f}с ({elapsed/60:.1f}хв)")
+        print(f"🤖  Агентів запущено: {total_agents}")
+        print(f"✅  Успішно:          {success_agents}")
+        print(f"❌  Помилок:          {failed_agents}")
+        print(f"📄  Файлів створено:  {total_files}")
+        print(f"🔄  Retry:            {total_retries}")
+        print()
+        print("📋  Деталі по фазам:")
+        for rec in self.records:
+            if rec.attempt > 1:
+                retry_info = f" (retry {rec.attempt}/{rec.max_retries})"
+            else:
+                retry_info = ""
+            icon = "✅" if rec.status == "success" else "❌"
+            files_info = f", {rec.files_written} файлів, {rec.patches_applied} патчів" if rec.files_written or rec.patches_applied else ""
+            err_info = f" [{rec.error_code}] {rec.error_message[:60]}" if rec.error_code else ""
+            print(f"  {icon} {rec.role}{retry_info}: {rec.duration:.0f}с{files_info}{err_info}")
+        if failed_agents:
+            print()
+            print("⚠️  Помилки:")
+            for rec in self.records:
+                if rec.status == "failed" and rec.error_code:
+                    print(f"  [{rec.error_code}] {rec.error_message[:120]}")
+        print("═" * 55 + "\n")
+
+    def _live(self, msg: str):
+        """Print live progress message (always visible)."""
+        print(msg, flush=True)
+
+
+# ═══════════════════════════════════════════════════
 # ERROR TAXONOMY (P5)
 # ═══════════════════════════════════════════════════
 
@@ -591,6 +714,7 @@ class MarkdownAgent:
         self.raw_output = ""
         self.secure_workspace = secure_workspace
         self.model = model
+        self.run_duration = 0.0
 
         # Token-aware retry context
         retry_context = ""
@@ -688,6 +812,7 @@ class MarkdownAgent:
             self.raw_output = "".join(output_lines)
 
         elapsed = time.time() - start
+        self.run_duration = elapsed
 
         # Parse output
         self.files = _parse_filepath_blocks(self.raw_output)
@@ -792,9 +917,15 @@ async def auto_fix(role, task_prompt, project_dir, max_retries=3,
     """Auto-fix with error taxonomy and retry strategies."""
     previous_code = ""
     previous_error = ""
+    global REPORT
     
     for attempt in range(1, max_retries + 1):
         log(f"  {role} attempt {attempt}/{max_retries}")
+        
+        # Report: start agent
+        rec = None
+        if REPORT:
+            rec = REPORT.start_agent("", role, model, attempt, max_retries)
 
         agent = MarkdownAgent(
             role, "Ти — Developer. Пиши код.",
@@ -806,10 +937,21 @@ async def auto_fix(role, task_prompt, project_dir, max_retries=3,
         await agent.run()
 
         if agent.success:
+            if REPORT and rec:
+                REPORT.complete_agent(rec, "success", agent.run_duration,
+                    files=len(agent.files),
+                    patches=0,
+                    error_code=agent.error_code.value if agent.error_code else "",
+                    error_msg=agent.error)
             return agent
 
-        # Use error taxonomy to decide retry strategy
+        # Report: failed attempt
         ec = agent.error_code or classify_error(agent.error, agent.raw_output)
+        if REPORT and rec:
+            REPORT.complete_agent(rec, "failed", agent.run_duration,
+                error_code=ec.value,
+                error_msg=agent.error)
+
         strategy = ERROR_STRATEGIES.get(ec, ERROR_STRATEGIES[ErrorCode.UNKNOWN])
         
         if not strategy["retry"]:
@@ -834,6 +976,7 @@ async def run_node(node: Node, sm: StateMachine, request: str,
                    project_dir: str, resources: ResourceManager) -> bool:
     """Execute a single DAG node and transition."""
     log(f"🏗 DAG node: {node.id} ({node.type.value})")
+    global REPORT
     
     task = node.task_template.format(request=request) if node.task_template else request
     context = load_phase_context(project_dir, node.id)
@@ -842,6 +985,8 @@ async def run_node(node: Node, sm: StateMachine, request: str,
 
     max_parallel = resources.get_max_concurrent()
     log(f"  Capacity: {max_parallel} concurrent agents")
+    if REPORT:
+        REPORT.resource_status(max_parallel, 0)
 
     if node.type == NodeType.ANALYZE:
         agents = await run_parallel([
@@ -927,6 +1072,13 @@ async def run_node(node: Node, sm: StateMachine, request: str,
     status = "success" if success else "failure"
     next_node = sm.transition(node.id, status)
     
+    if REPORT:
+        if not success and errors:
+            ec = error_code.value if error_code else "UNKNOWN"
+            REPORT.phase_error(node.id, ec, errors[0])
+        if next_node and next_node != node.id:
+            REPORT.start_phase(next_node, sm.nodes[next_node].type.value if next_node in sm.nodes else "?")
+    
     if next_node and next_node != node.id:
         log(f"  ➡️ {node.id} → {next_node} ({status})")
         if next_node == "error":
@@ -957,14 +1109,20 @@ async def run_dag(workflow_nodes: List[Node], edges: List[tuple],
 
     resources = ResourceManager(project_dir)
     start = time.time()
+    
+    # Init report
+    init_report()
+    global REPORT
 
     start_node = workflow_nodes[0].id if workflow_nodes else None
     if not start_node:
         log("❌ No start node in workflow", "ERROR")
         return False
 
-    log(f"🏁 DAG start: {start_node}")
+    REPORT.start_phase(start_node, workflow_nodes[0].type.value)
     ok = await run_node(sm.nodes[start_node], sm, request, project_dir, resources)
+    REPORT.end_phase(start_node, "success" if ok else "failure")
+    REPORT.print_final_summary()
     log(f"🏁 DAG done ({time.time()-start:.0f}s): {'✅' if ok else '❌'}")
     return ok
 

@@ -1,0 +1,893 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Колобок: Втеча з Лабіринту</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  background:#0d0d1a;
+  color:#c8c8d4;
+  font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+  min-height:100vh;
+  display:flex;
+  justify-content:center;
+  align-items:center;
+}
+#game-container{
+  background:#141428;
+  border-radius:16px;
+  padding:24px;
+  box-shadow:0 0 60px rgba(100,80,200,.15),0 0 120px rgba(80,60,180,.08);
+  border:1px solid #2a2a4a;
+  max-width:1140px;
+}
+h1{
+  text-align:center;
+  font-size:28px;
+  font-weight:700;
+  margin-bottom:16px;
+  background:linear-gradient(135deg,#f0c040,#e89020);
+  -webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;
+  text-shadow:none;
+  letter-spacing:1px;
+}
+#game-area{
+  display:flex;
+  gap:20px;
+  align-items:flex-start;
+}
+canvas{
+  border-radius:10px;
+  border:2px solid #2a2a4a;
+  display:block;
+  background:#1a1a2e;
+}
+#info-panel{
+  width:270px;
+  flex-shrink:0;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+.panel-box{
+  background:#1e1e36;
+  border-radius:10px;
+  padding:14px 16px;
+  border:1px solid #2e2e50;
+}
+.panel-box h2{
+  font-size:13px;
+  text-transform:uppercase;
+  letter-spacing:1.5px;
+  color:#8888aa;
+  margin-bottom:10px;
+  font-weight:600;
+}
+.legend-item{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:4px 0;
+  font-size:13px;
+}
+.legend-swatch{
+  width:24px;height:24px;
+  border-radius:5px;
+  border:1px solid #3a3a5a;
+  flex-shrink:0;
+}
+.legend-label{flex:1}
+.legend-weight{color:#8888aa;font-size:11px}
+.stat-row{
+  display:flex;
+  justify-content:space-between;
+  padding:5px 0;
+  font-size:14px;
+  border-bottom:1px solid #2a2a48;
+}
+.stat-row:last-child{border-bottom:none}
+.stat-label{color:#8888aa}
+.stat-value{font-weight:600;font-variant-numeric:tabular-nums}
+.stat-value.steps{color:#6ab0f3}
+.stat-value.time{color:#f0c040}
+.stat-value.optimal{color:#4ade80}
+.controls-info{
+  font-size:12px;
+  color:#7777aa;
+  line-height:1.6;
+}
+.controls-info kbd{
+  background:#2a2a4a;
+  padding:2px 7px;
+  border-radius:4px;
+  font-size:11px;
+  color:#c8c8e0;
+  border:1px solid #3a3a5a;
+}
+#overlay{
+  position:absolute;
+  top:0;left:0;
+  width:800px;height:600px;
+  border-radius:10px;
+  display:none;
+  justify-content:center;
+  align-items:center;
+  flex-direction:column;
+  gap:16px;
+  z-index:10;
+  pointer-events:none;
+}
+#overlay.show{
+  display:flex;
+  pointer-events:all;
+}
+#overlay.win{
+  background:rgba(0,0,0,.72);
+  backdrop-filter:blur(4px);
+}
+#overlay.lose{
+  background:rgba(0,0,0,.75);
+  backdrop-filter:blur(4px);
+}
+#overlay .title{
+  font-size:42px;
+  font-weight:800;
+}
+#overlay.win .title{color:#f0c040}
+#overlay.lose .title{color:#e74c3c}
+#overlay .subtitle{
+  font-size:16px;
+  color:#aaaacc;
+}
+#overlay .restart-btn{
+  margin-top:10px;
+  padding:12px 36px;
+  border-radius:10px;
+  border:none;
+  font-size:16px;
+  font-weight:600;
+  cursor:pointer;
+  transition:all .2s;
+  background:linear-gradient(135deg,#6c5ce7,#a855f7);
+  color:#fff;
+}
+#overlay .restart-btn:hover{
+  transform:scale(1.05);
+  box-shadow:0 0 30px rgba(108,92,231,.4);
+}
+.canvas-wrapper{
+  position:relative;
+  display:inline-block;
+}
+.grandma-warning{
+  color:#e74c3c;
+  font-size:12px;
+  font-weight:600;
+  display:none;
+  animation:pulse 1s infinite;
+}
+.grandma-warning.show{display:block}
+@keyframes pulse{
+  0%,100%{opacity:1}
+  50%{opacity:.5}
+}
+#toggle-path{
+  background:#2a2a4a;
+  border:1px solid #3a3a5a;
+  color:#c8c8d4;
+  padding:6px 14px;
+  border-radius:6px;
+  font-size:12px;
+  cursor:pointer;
+  transition:all .2s;
+  margin-top:4px;
+}
+#toggle-path:hover{background:#3a3a5a}
+#toggle-path.on{background:#4ade80;color:#0d0d1a;border-color:#4ade80}
+</style>
+</head>
+<body>
+
+<div id="game-container">
+  <h1>🥟 Колобок: Втеча з Лабіринту</h1>
+  <div id="game-area">
+    <div class="canvas-wrapper">
+      <canvas id="gameCanvas" width="800" height="600"></canvas>
+      <div id="overlay">
+        <div class="title"></div>
+        <div class="subtitle"></div>
+        <button class="restart-btn" onclick="restartGame()">🔄 Грати знову</button>
+      </div>
+    </div>
+    <div id="info-panel">
+      <div class="panel-box">
+        <h2>📊 Статистика</h2>
+        <div class="stat-row">
+          <span class="stat-label">Кроків</span>
+          <span class="stat-value steps" id="stepsDisplay">0</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Час</span>
+          <span class="stat-value time" id="timeDisplay">0:00</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Оптимально</span>
+          <span class="stat-value optimal" id="optimalDisplay">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Кращих кроків</span>
+          <span class="stat-value" id="extraSteps" style="color:#e74c3c">—</span>
+        </div>
+        <div class="grandma-warning" id="grandmaWarning">⚠ Бабуся близько!</div>
+      </div>
+      <div class="panel-box">
+        <h2>🗺 Поверхні</h2>
+        <div class="legend-item"><div class="legend-swatch" style="background:#5c5c72"></div><span class="legend-label">Доріжка</span><span class="legend-weight">×1</span></div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#3a7d44"></div><span class="legend-label">Трава</span><span class="legend-weight">×3</span></div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#5a3a28"></div><span class="legend-label">Болото</span><span class="legend-weight">×6</span></div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#4a8a9e"></div><span class="legend-label">Лід 🧊</span><span class="legend-weight">×2</span></div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#2d2d3d;border-color:#555"></div><span class="legend-label">Стіна</span><span class="legend-weight">—</span></div>
+        <div class="legend-item"><div class="legend-swatch" style="background:linear-gradient(135deg,#c9a84c,#f0d060)"></div><span class="legend-label">Вихід 🏁</span><span class="legend-weight">—</span></div>
+      </div>
+      <div class="panel-box">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <h2 style="margin-bottom:0">🎯 Маршрут</h2>
+          <button id="toggle-path" class="on" onclick="toggleOptimalPath()">✕ сховати</button>
+        </div>
+        <div class="controls-info" style="margin-top:8px">
+          A* з урахуванням ваги поверхонь. Зелена пунктирна лінія — найкращий шлях.
+        </div>
+      </div>
+      <div class="panel-box">
+        <h2>🎮 Керування</h2>
+        <div class="controls-info">
+          <kbd>W</kbd> <kbd>↑</kbd> — вгору<br>
+          <kbd>S</kbd> <kbd>↓</kbd> — вниз<br>
+          <kbd>A</kbd> <kbd>←</kbd> — вліво<br>
+          <kbd>D</kbd> <kbd>→</kbd> — вправо<br><br>
+          🧊 <strong>Лід:</strong> автоматичне ковзання в обраному напрямку
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── CONSTANTS ─────────────────────────────────────────
+const COLS = 20;
+const ROWS = 15;
+const TILE = 40;
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const T = { PATH:0, GRASS:1, SWAMP:2, ICE:3, WALL:4, FINISH:5 };
+const WEIGHT = { 0:1, 1:3, 2:6, 3:2, 4:Infinity, 5:1 };
+const TERRAIN_COLORS = {
+  0: '#5c5c72',
+  1: '#3a7d44',
+  2: '#5a3a28',
+  3: '#4a8a9e',
+  4: '#2d2d3d',
+  5: '#c9a84c',
+};
+
+const MAP = [
+  [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
+  [4,0,0,0,0,4,0,0,0,0,0,4,0,1,1,1,0,0,0,4],
+  [4,0,4,4,0,4,0,4,4,4,0,4,0,4,0,0,0,4,0,4],
+  [4,0,4,0,0,0,0,4,1,1,0,0,0,4,0,4,0,4,0,4],
+  [4,0,4,0,4,4,0,4,0,0,0,4,0,4,0,4,0,4,0,4],
+  [4,0,0,0,4,0,0,0,0,4,0,4,0,0,0,4,0,0,0,4],
+  [4,4,4,0,4,0,4,4,0,4,0,4,4,4,0,4,4,4,0,4],
+  [4,2,2,0,0,0,4,2,0,0,0,0,0,0,0,0,2,2,0,4],
+  [4,4,4,4,4,0,4,4,4,4,4,4,4,4,4,4,4,4,0,4],
+  [4,0,0,0,0,0,0,0,0,0,0,3,3,3,0,0,0,0,0,4],
+  [4,0,4,4,4,4,4,4,4,0,4,4,4,3,4,4,4,4,0,4],
+  [4,0,4,0,0,0,0,0,0,0,4,0,0,0,0,0,0,4,0,4],
+  [4,0,4,0,4,4,4,4,4,0,4,0,4,0,0,0,4,4,0,4],
+  [4,0,0,0,4,0,0,0,0,0,0,0,4,0,0,0,0,0,5,4],
+  [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
+];
+
+// ─── GAME STATE ─────────────────────────────────────────
+let player = { x:1, y:1 };
+let grandma = { x:3, y:1 };
+let finish = { x:18, y:13 };
+let steps = 0;
+let gameTime = 0;
+let gameActive = false;
+let gameOver = false;
+let gameWon = false;
+let timerInterval = null;
+let optimalPath = [];
+let showOptimalPath = true;
+let isSliding = false;
+let slideMovement = [];
+let grandmaMoveCounter = 0;
+const GRANDMA_EVERY = 2; // steps before grandma moves
+let bestPathCost = Infinity;
+let lastMoveTime = 0;
+const MOVE_COOLDOWN = 100; // ms
+
+// ─── DOM REFS ──────────────────────────────────────────
+const stepsDisplay = document.getElementById('stepsDisplay');
+const timeDisplay = document.getElementById('timeDisplay');
+const optimalDisplay = document.getElementById('optimalDisplay');
+const extraSteps = document.getElementById('extraSteps');
+const overlay = document.getElementById('overlay');
+const overlayTitle = overlay.querySelector('.title');
+const overlaySub = overlay.querySelector('.subtitle');
+const grandmaWarning = document.getElementById('grandmaWarning');
+
+// ─── A* PATHFINDING ─────────────────────────────────────
+function manhattan(x1,y1,x2,y2){return Math.abs(x1-x2)+Math.abs(y1-y2)}
+
+function astar(sx,sy,gx,gy){
+  const open=[{x:sx,y:sy,g:0,f:manhattan(sx,sy,gx,gy),parent:null}];
+  const closed=new Set();
+  const gScore={};
+  const key=(x,y)=>`${x},${y}`;
+  gScore[key(sx,sy)]=0;
+
+  while(open.length>0){
+    let best=0;
+    for(let i=1;i<open.length;i++)if(open[i].f<open[best].f)best=i;
+    const cur=open.splice(best,1)[0];
+    const ck=key(cur.x,cur.y);
+    if(cur.x===gx&&cur.y===gy){
+      const path=[];
+      let n=cur;
+      while(n){path.unshift({x:n.x,y:n.y});n=n.parent;}
+      return {path,cost:cur.g};
+    }
+    closed.add(ck);
+    for(const [dx,dy] of [[0,-1],[0,1],[-1,0],[1,0]]){
+      const nx=cur.x+dx,ny=cur.y+dy;
+      if(nx<0||nx>=COLS||ny<0||ny>=ROWS)continue;
+      if(MAP[ny][nx]===T.WALL)continue;
+      const nk=key(nx,ny);
+      if(closed.has(nk))continue;
+      const w=WEIGHT[MAP[ny][nx]];
+      if(!isFinite(w))continue;
+      const ng=cur.g+w;
+      if(gScore[nk]!==undefined&&ng>=gScore[nk])continue;
+      gScore[nk]=ng;
+      const existing=open.find(n=>n.x===nx&&n.y===ny);
+      const f=ng+manhattan(nx,ny,gx,gy);
+      if(existing){
+        if(ng<existing.g){existing.g=ng;existing.f=f;existing.parent=cur;}
+      }else{
+        open.push({x:nx,y:ny,g:ng,f,parent:cur});
+      }
+    }
+  }
+  return null;
+}
+
+function updateOptimalPath(){
+  const result=astar(player.x,player.y,finish.x,finish.y);
+  if(result){
+    optimalPath=result.path;
+    bestPathCost=result.cost;
+    optimalDisplay.textContent=result.cost;
+    const diff=steps-result.cost;
+    extraSteps.textContent=diff>0?`+${diff}`:'0';
+    extraSteps.style.color=diff>5?'#e74c3c':diff>0?'#f0c040':'#4ade80';
+  }else{
+    optimalPath=[];
+    optimalDisplay.textContent='—';
+    extraSteps.textContent='—';
+  }
+}
+
+// ─── GRANDMA AI ────────────────────────────────────────
+function moveGrandma(){
+  // BFS toward player
+  const queue=[{x:grandma.x,y:grandma.y,path:[]}];
+  const visited=new Set();
+  const gk=(x,y)=>`${x},${y}`;
+  visited.add(gk(grandma.x,grandma.y));
+  let bestMove=null;
+  let bestDist=Infinity;
+
+  // Simple greedy: try directions toward player
+  const dirs=[
+    {dx:0,dy:-1,score:0},{dx:0,dy:1,score:0},{dx:-1,dy:0,score:0},{dx:1,dy:0,score:0}
+  ];
+  // Score by reducing Manhattan distance
+  for(const d of dirs){
+    const nx=grandma.x+d.dx,ny=grandma.y+d.dy;
+    if(nx<0||nx>=COLS||ny<0||ny>=ROWS)continue;
+    if(MAP[ny][nx]===T.WALL)continue;
+    const dist=manhattan(nx,ny,player.x,player.y);
+    d.score=dist;
+    if(dist<bestDist){bestDist=dist;bestMove=d;}
+  }
+
+  if(bestMove){
+    // Prefer moving in direction that reduces distance most
+    // If equal, prefer same axis as player delta
+    grandma.x+=bestMove.dx;
+    grandma.y+=bestMove.dy;
+  }
+}
+
+// ─── ICE SLIDING ────────────────────────────────────────
+function processSlide(dx,dy){
+  const moves=[];
+  let cx=player.x+dx,cy=player.y+dy;
+  while(true){
+    if(cx<0||cx>=COLS||cy<0||cy>=ROWS)break;
+    if(MAP[cy][cx]===T.WALL)break;
+    moves.push({x:cx,y:cy});
+    if(MAP[cy][cx]!==T.ICE)break;
+    cx+=dx;cy+=dy;
+  }
+  return moves;
+}
+
+// ─── PLAYER MOVE ───────────────────────────────────────
+function movePlayer(dx,dy){
+  if(!gameActive||gameOver||gameWon)return;
+  if(isSliding)return;
+  const now=Date.now();
+  if(now-lastMoveTime<MOVE_COOLDOWN)return;
+  lastMoveTime=now;
+
+  const nx=player.x+dx,ny=player.y+dy;
+  if(nx<0||nx>=COLS||ny<0||ny>=ROWS)return;
+  if(MAP[ny][nx]===T.WALL)return;
+
+  // Execute move
+  player.x=nx;
+  player.y=ny;
+  steps++;
+  stepsDisplay.textContent=steps;
+
+  // Check finish
+  if(MAP[ny][nx]===T.FINISH){
+    winGame();
+    return;
+  }
+
+    // Ice sliding
+    if(MAP[ny][nx]===T.ICE){
+      isSliding=true;
+      slideMovement=processSlide(dx,dy);
+      for(let i=0;i<slideMovement.length;i++){
+        const m=slideMovement[i];
+        player.x=m.x;
+        player.y=m.y;
+        steps++;
+        stepsDisplay.textContent=steps;
+        if(MAP[m.y][m.x]===T.FINISH){
+          isSliding=false;slideMovement=[];
+          winGame();return;
+        }
+        // Grandma accumulates during slide
+        grandmaMoveCounter++;
+        if(grandmaMoveCounter>=GRANDMA_EVERY){
+          grandmaMoveCounter=0;
+          moveGrandma();
+          if(player.x===grandma.x&&player.y===grandma.y){
+            isSliding=false;slideMovement=[];
+            loseGame();return;
+          }
+        }
+      }
+      isSliding=false;
+      slideMovement=[];
+      // Re-check grandma distance after slide
+      const dist=manhattan(player.x,player.y,grandma.x,grandma.y);
+      grandmaWarning.classList.toggle('show',dist<=3);
+      updateOptimalPath();
+      render();
+      return;
+    }
+
+  // Grandma logic
+  grandmaMoveCounter++;
+  if(grandmaMoveCounter>=GRANDMA_EVERY){
+    grandmaMoveCounter=0;
+    moveGrandma();
+  }
+
+  // Check catch
+  if(player.x===grandma.x&&player.y===grandma.y){
+    loseGame();
+    return;
+  }
+
+  // Warning
+  const dist=manhattan(player.x,player.y,grandma.x,grandma.y);
+  grandmaWarning.classList.toggle('show',dist<=3);
+
+  // Update path
+  updateOptimalPath();
+}
+
+// ─── TIMER ──────────────────────────────────────────────
+function startTimer(){
+  if(timerInterval)return;
+  gameTime=0;
+  gameActive=true;
+  timerInterval=setInterval(()=>{
+    gameTime++;
+    const m=Math.floor(gameTime/60);
+    const s=gameTime%60;
+    timeDisplay.textContent=`${m}:${s.toString().padStart(2,'0')}`;
+  },1000);
+}
+
+// ─── WIN / LOSE ─────────────────────────────────────────
+function winGame(){
+  gameWon=true;
+  gameActive=false;
+  if(timerInterval){clearInterval(timerInterval);timerInterval=null;}
+  overlay.classList.add('show','win');
+  overlayTitle.textContent='🎉 Перемога!';
+  const m=Math.floor(gameTime/60);
+  const s=gameTime%60;
+  overlaySub.textContent=`Колобок втік! ${steps} кроків за ${m}:${s.toString().padStart(2,'0')}`;
+}
+
+function loseGame(){
+  gameOver=true;
+  gameActive=false;
+  if(timerInterval){clearInterval(timerInterval);timerInterval=null;}
+  overlay.classList.add('show','lose');
+  overlayTitle.textContent='😱 Бабуся зловила!';
+  const m=Math.floor(gameTime/60);
+  const s=gameTime%60;
+  overlaySub.textContent=`Колобка спіймали! ${steps} кроків, ${m}:${s.toString().padStart(2,'0')}`;
+}
+
+function restartGame(){
+  overlay.classList.remove('show','win','lose');
+  player={x:1,y:1};
+  grandma={x:3,y:1};
+  steps=0;
+  gameTime=0;
+  gameActive=false;
+  gameOver=false;
+  gameWon=false;
+  isSliding=false;
+  slideMovement=[];
+  grandmaMoveCounter=0;
+  lastMoveTime=0;
+  if(timerInterval){clearInterval(timerInterval);timerInterval=null;}
+  stepsDisplay.textContent='0';
+  timeDisplay.textContent='0:00';
+  optimalDisplay.textContent='—';
+  extraSteps.textContent='—';
+  grandmaWarning.classList.remove('show');
+  updateOptimalPath();
+  render();
+}
+
+function toggleOptimalPath(){
+  showOptimalPath=!showOptimalPath;
+  const btn=document.getElementById('toggle-path');
+  btn.textContent=showOptimalPath?'✕ сховати':'◉ показати';
+  btn.classList.toggle('on',showOptimalPath);
+  render();
+}
+
+// ─── RENDERING ──────────────────────────────────────────
+function drawTerrain(x,y,type){
+  const px=x*TILE,py=y*TILE;
+  // Base tile
+  ctx.fillStyle=TERRAIN_COLORS[type]||'#1a1a2e';
+  ctx.fillRect(px,py,TILE,TILE);
+
+  switch(type){
+    case T.PATH:
+      // Subtle dots
+      ctx.fillStyle='rgba(255,255,255,.06)';
+      ctx.fillRect(px+8,py+8,4,4);
+      ctx.fillRect(px+24,py+20,4,4);
+      ctx.fillRect(px+14,py+30,4,4);
+      break;
+    case T.GRASS:
+      // Grass blades
+      ctx.strokeStyle='rgba(80,160,60,.5)';
+      ctx.lineWidth=1.5;
+      for(let i=0;i<3;i++){
+        const gx=px+8+i*12,gy=py+6+i*10;
+        ctx.beginPath();
+        ctx.moveTo(gx,gy+12);
+        ctx.lineTo(gx-2,gy);
+        ctx.lineTo(gx+3,gy-4);
+        ctx.stroke();
+      }
+      break;
+    case T.SWAMP:
+      // Bubbles
+      ctx.fillStyle='rgba(100,70,40,.4)';
+      ctx.beginPath();
+      ctx.arc(px+10,py+12,4,0,Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle='rgba(80,50,30,.3)';
+      ctx.beginPath();
+      ctx.arc(px+28,py+28,3,0,Math.PI*2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(px+18,py+34,2,0,Math.PI*2);
+      ctx.fill();
+      break;
+    case T.ICE:
+      // Shimmer
+      ctx.fillStyle='rgba(180,220,240,.15)';
+      for(let i=0;i<4;i++){
+        const sx=px+5+i*9, sy=py+4+i*11;
+        ctx.beginPath();
+        ctx.arc(sx,sy,3,0,Math.PI*2);
+        ctx.fill();
+      }
+      ctx.strokeStyle='rgba(200,230,255,.12)';
+      ctx.lineWidth=1;
+      ctx.beginPath();
+      const cx=px+20,cy=py+20;
+      ctx.moveTo(cx-8,cy-8);ctx.lineTo(cx+8,cy+8);
+      ctx.moveTo(cx-8,cy+8);ctx.lineTo(cx+8,cy-8);
+      ctx.stroke();
+      break;
+    case T.WALL:
+      // Brick pattern
+      ctx.strokeStyle='rgba(60,60,80,.4)';
+      ctx.lineWidth=1;
+      for(let r=0;r<3;r++){
+        const wy=py+r*14;
+        ctx.beginPath();
+        ctx.moveTo(px,wy+7);ctx.lineTo(px+TILE,wy+7);
+        ctx.stroke();
+        const offset=r%2===0?0:10;
+        for(let c=0;c<2;c++){
+          ctx.beginPath();
+          ctx.moveTo(px+offset+c*18,wy);ctx.lineTo(px+offset+c*18,wy+13);
+          ctx.stroke();
+        }
+      }
+      break;
+    case T.FINISH:
+      // Glow effect
+      const grad=ctx.createRadialGradient(px+20,py+20,2,px+20,py+20,18);
+      grad.addColorStop(0,'rgba(240,200,80,.3)');
+      grad.addColorStop(1,'rgba(200,160,60,0)');
+      ctx.fillStyle=grad;
+      ctx.fillRect(px,py,TILE,TILE);
+      // Gold border
+      ctx.strokeStyle='rgba(240,200,80,.4)';
+      ctx.lineWidth=2;
+      ctx.strokeRect(px+2,py+2,TILE-4,TILE-4);
+      // Flag icon
+      ctx.fillStyle='#f0c040';
+      ctx.font='18px sans-serif';
+      ctx.textAlign='center';
+      ctx.textBaseline='middle';
+      ctx.fillText('🏁',px+20,py+20);
+      break;
+  }
+}
+
+function drawKolobok(x,y){
+  const cx=x*TILE+TILE/2,cy=y*TILE+TILE/2;
+  const r=TILE/2-4;
+
+  // Shadow
+  ctx.fillStyle='rgba(0,0,0,.25)';
+  ctx.beginPath();
+  ctx.ellipse(cx+2,cy+3,r,r,0,0,Math.PI*2);
+  ctx.fill();
+
+  // Body
+  const grad=ctx.createRadialGradient(cx-4,cy-4,2,cx,cy,r);
+  grad.addColorStop(0,'#ffe566');
+  grad.addColorStop(0.7,'#ffc800');
+  grad.addColorStop(1,'#d4a000');
+  ctx.fillStyle=grad;
+  ctx.beginPath();
+  ctx.arc(cx,cy,r,0,Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle='rgba(180,130,0,.3)';
+  ctx.lineWidth=1.5;
+  ctx.stroke();
+
+  // Eyes
+  ctx.fillStyle='#1a1a2e';
+  ctx.beginPath();
+  ctx.arc(cx-5,cy-4,3,0,Math.PI*2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(cx+5,cy-4,3,0,Math.PI*2);
+  ctx.fill();
+  // Eye shine
+  ctx.fillStyle='#fff';
+  ctx.beginPath();
+  ctx.arc(cx-4,cy-5,1.2,0,Math.PI*2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(cx+6,cy-5,1.2,0,Math.PI*2);
+  ctx.fill();
+  // Cheeks
+  ctx.fillStyle='rgba(255,150,150,.25)';
+  ctx.beginPath();
+  ctx.arc(cx-9,cy+4,4,0,Math.PI*2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(cx+9,cy+4,4,0,Math.PI*2);
+  ctx.fill();
+  // Smile
+  ctx.strokeStyle='#8a6a00';
+  ctx.lineWidth=1.5;
+  ctx.beginPath();
+  ctx.arc(cx,cy+1,7,0.15*Math.PI,0.85*Math.PI);
+  ctx.stroke();
+}
+
+function drawGrandma(x,y){
+  const cx=x*TILE+TILE/2,b=y*TILE+TILE;
+  const headR=7,bodyW=12,bodyH=16;
+
+  // Shadow
+  ctx.fillStyle='rgba(0,0,0,.2)';
+  ctx.beginPath();
+  ctx.ellipse(cx+2,b-2,8,4,0,0,Math.PI*2);
+  ctx.fill();
+
+  // Body (dress)
+  ctx.fillStyle='#c0392b';
+  ctx.beginPath();
+  ctx.moveTo(cx-bodyW/2,b-bodyH);
+  ctx.lineTo(cx,b);
+  ctx.lineTo(cx+bodyW/2,b-bodyH);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle='rgba(150,40,30,.4)';
+  ctx.lineWidth=1;
+  ctx.stroke();
+
+  // Apron
+  ctx.fillStyle='rgba(255,255,255,.15)';
+  ctx.fillRect(cx-6,b-bodyH+8,12,10);
+
+  // Head
+  const grad=ctx.createRadialGradient(cx-2,b-bodyH-10,2,cx,b-bodyH-6,headR);
+  grad.addColorStop(0,'#f0d0b0');
+  grad.addColorStop(1,'#d4b090');
+  ctx.fillStyle=grad;
+  ctx.beginPath();
+  ctx.arc(cx,b-bodyH-6,headR,0,Math.PI*2);
+  ctx.fill();
+
+  // Scarf / headscarf (хустка)
+  ctx.fillStyle='#e74c3c';
+  ctx.beginPath();
+  ctx.moveTo(cx-headR,b-bodyH-6);
+  ctx.arc(cx,b-bodyH-12,headR+2,Math.PI,0);
+  ctx.closePath();
+  ctx.fill();
+  // Scarf knot
+  ctx.beginPath();
+  ctx.arc(cx+3,b-bodyH-5,2,0,Math.PI*2);
+  ctx.fill();
+
+  // Eyes (angry)
+  ctx.fillStyle='#2a1a0a';
+  ctx.fillRect(cx-5,b-bodyH-9,4,2);
+  ctx.fillRect(cx+2,b-bodyH-9,4,2);
+  // Eyebrows (angry)
+  ctx.strokeStyle='#8a6a50';
+  ctx.lineWidth=1.5;
+  ctx.beginPath();
+  ctx.moveTo(cx-7,b-bodyH-11);ctx.lineTo(cx-3,b-bodyH-10);
+  ctx.moveTo(cx+4,b-bodyH-10);ctx.lineTo(cx+8,b-bodyH-11);
+  ctx.stroke();
+  // Mouth (frowning)
+  ctx.beginPath();
+  ctx.arc(cx,b-bodyH-3,4,Math.PI*1.2,Math.PI*1.8);
+  ctx.stroke();
+
+  // Arms
+  ctx.strokeStyle='#c0392b';
+  ctx.lineWidth=3;
+  ctx.beginPath();
+  ctx.moveTo(cx-bodyW/2,b-bodyH+2);
+  ctx.lineTo(cx-bodyW/2-4,b-bodyH-2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx+bodyW/2,b-bodyH+2);
+  ctx.lineTo(cx+bodyW/2+5,b-bodyH-3);
+  ctx.stroke();
+  // Hands
+  ctx.fillStyle='#f0d0b0';
+  ctx.beginPath();
+  ctx.arc(cx-bodyW/2-4,b-bodyH-2,3,0,Math.PI*2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(cx+bodyW/2+5,b-bodyH-3,3,0,Math.PI*2);
+  ctx.fill();
+}
+
+function drawOptimalPath(){
+  if(!showOptimalPath||optimalPath.length<2)return;
+  ctx.save();
+  ctx.setLineDash([4,5]);
+  ctx.strokeStyle='rgba(74,222,128,.65)';
+  ctx.lineWidth=2.5;
+  ctx.shadowColor='rgba(74,222,128,.2)';
+  ctx.shadowBlur=6;
+  ctx.beginPath();
+  for(let i=0;i<optimalPath.length;i++){
+    const cx=optimalPath[i].x*TILE+TILE/2;
+    const cy=optimalPath[i].y*TILE+TILE/2;
+    if(i===0)ctx.moveTo(cx,cy);
+    else ctx.lineTo(cx,cy);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function render(){
+  ctx.imageSmoothingEnabled=false;
+
+  // Clear
+  ctx.fillStyle='#1a1a2e';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // Draw terrain
+  for(let y=0;y<ROWS;y++){
+    for(let x=0;x<COLS;x++){
+      drawTerrain(x,y,MAP[y][x]);
+    }
+  }
+
+  // Grid lines
+  ctx.strokeStyle='rgba(255,255,255,.04)';
+  ctx.lineWidth=0.5;
+  for(let x=0;x<=COLS;x++){
+    ctx.beginPath();
+    ctx.moveTo(x*TILE,0);ctx.lineTo(x*TILE,ROWS*TILE);
+    ctx.stroke();
+  }
+  for(let y=0;y<=ROWS;y++){
+    ctx.beginPath();
+    ctx.moveTo(0,y*TILE);ctx.lineTo(COLS*TILE,y*TILE);
+    ctx.stroke();
+  }
+
+  // Optimal path
+  drawOptimalPath();
+
+  // Grandma
+  drawGrandma(grandma.x,grandma.y);
+
+  // Player
+  drawKolobok(player.x,player.y);
+}
+
+// ─── INPUT ──────────────────────────────────────────────
+document.addEventListener('keydown',e=>{
+  if(gameOver||gameWon)return;
+  if(isSliding)return;
+  if(!gameActive){
+    startTimer();
+    updateOptimalPath();
+  }
+  switch(e.key){
+    case 'w':case 'W':case 'ArrowUp':    e.preventDefault();movePlayer(0,-1);render();break;
+    case 's':case 'S':case 'ArrowDown':  e.preventDefault();movePlayer(0,1);render();break;
+    case 'a':case 'A':case 'ArrowLeft':  e.preventDefault();movePlayer(-1,0);render();break;
+    case 'd':case 'D':case 'ArrowRight': e.preventDefault();movePlayer(1,0);render();break;
+  }
+});
+
+// ─── START ──────────────────────────────────────────────
+updateOptimalPath();
+render();
+</script>
+</body>
+</html>
