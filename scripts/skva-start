@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""
+SKVA entry point. Just run it. No arguments needed.
+"""
+import os, sys
+sys.path.insert(0, os.path.dirname(__file__))
+from skva_gatekeeper import main
+main()
