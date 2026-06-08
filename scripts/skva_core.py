@@ -358,6 +358,31 @@ class SecureWorkspace:
             (self.temp_dir / sub).chmod(0o700)
         self._created = True
 
+    def seed_from_project(self, project_dir: str):
+        """Copy project files into work_dir as input context for the agent.
+        Skips binary files, node_modules, .git, __pycache__ etc."""
+        src = Path(project_dir)
+        if not src.exists():
+            log(f"  seed: project dir {project_dir} does not exist, skipping", "WARN")
+            return
+        count = 0
+        for f in sorted(src.rglob("*")):
+            if not f.is_file():
+                continue
+            if _is_binary(f):
+                continue
+            rel = f.relative_to(src)
+            if any(skip in rel.parts for skip in SKIP_DIRS):
+                continue
+            try:
+                dst = self.work_dir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dst)
+                count += 1
+            except (OSError, PermissionError):
+                continue
+        log(f"  seeded {count} files into workspace work_dir")
+
     @property
     def work_dir(self) -> Path:
         return self.temp_dir / "work"
@@ -619,20 +644,24 @@ class MarkdownAgent:
             written_paths = []
             patch_count = 0
             for path, content in self.files.items():
+                # For existence check: use work_dir (where project was seeded)
+                check_path = self.project_dir / path if not self.secure_workspace \
+                    else self.secure_workspace.work_dir / path
+                # For writing output: use output_dir
                 full_path = self.project_dir / path if not self.secure_workspace \
                     else self.secure_workspace.output_dir / path
                 full_path.parent.mkdir(parents=True, exist_ok=True)
 
                 # Detect SEARCH/REPLACE blocks inside this file's content
                 inner_sr = parse_search_replace_blocks(content)
-                if inner_sr and full_path.exists():
-                    # Apply as patch to existing file
-                    old_content = full_path.read_text()
+                if inner_sr and check_path.exists():
+                    # Apply as patch to existing file (from work_dir context)
+                    old_content = check_path.read_text()
                     patched = apply_search_replace(old_content, inner_sr)
                     full_path.write_text(patched)
                     patch_count += len(inner_sr)
                     written_paths.append(f"{path} (patch)")
-                elif inner_sr and not full_path.exists():
+                elif inner_sr and not check_path.exists():
                     # File doesn't exist yet — extract REPLACE content
                     replace_only = "\n\n".join(b[1] for b in inner_sr)
                     full_path.write_text(replace_only)
@@ -749,14 +778,17 @@ async def run_node(node: Node, sm: StateMachine, request: str,
         ], project_dir)
     elif node.type == NodeType.IMPLEMENT:
         with SecureWorkspace(prefix=f"skva_{node.id}_") as ws:
+            ws.seed_from_project(project_dir)
             agent = await auto_fix("developer", task, project_dir,
                                    secure_workspace=ws)
-            # Copy generated files to project
+            # Copy CLEAN files from output_dir to project
             if agent.success and agent.files:
-                for path, content in agent.files.items():
+                for path in agent.files.keys():
+                    src = ws.output_dir / path
                     dst = Path(project_dir) / path
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    dst.write_text(content)
+                    if src.exists():
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
         agents = [agent]
     elif node.type == NodeType.REVIEW:
         agent = MarkdownAgent(
@@ -768,14 +800,17 @@ async def run_node(node: Node, sm: StateMachine, request: str,
         agents = [agent]
     elif node.type == NodeType.FIX:
         with SecureWorkspace(prefix=f"skva_{node.id}_") as ws:
+            ws.seed_from_project(project_dir)
             agent = await auto_fix("developer", f"ВИПРАВ ПОМИЛКИ:\n{task}",
                                    project_dir, max_retries=2,
                                    secure_workspace=ws)
             if agent.success and agent.files:
-                for path, content in agent.files.items():
+                for path in agent.files.keys():
+                    src = ws.output_dir / path
                     dst = Path(project_dir) / path
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    dst.write_text(content)
+                    if src.exists():
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
         agents = [agent]
     elif node.type == NodeType.DEPLOY:
         agents = await run_parallel([
