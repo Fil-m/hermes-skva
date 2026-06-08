@@ -9,23 +9,26 @@
 
 ## Швидкий старт
 
-```bash
-# 1. Встановити Hermes (якщо ще нема)
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+**Найпростіший спосіб — взагалі без аргументів:**
 
-# 2. Встановити SKVA
+```bash
+# 1. Встановити
 git clone https://github.com/Fil-m/hermes-skva.git ~/.hermes-skva
 bash ~/.hermes-skva/install.sh
 source ~/.bashrc
 
-# 3. Перевірити
-skva doctor
+# 2. Просто запустити
+skva-start
 
-# 4. Запустити Solo
-skva solo "створи index.html з Hello World" /tmp/my-first-project
+# 3. Розповісти ідею
+# 👋 SKVA. Розкажи ідею проекту одним реченням.
+# > створи тетріс з темною темою
+#
+# Gatekeeper сам розпитає, збереже вимоги і запустить виробництво.
 
-# 5. Або через Hermes (повний цикл)
-hermes --skills skva-orchestrator
+# Або через Hermes (будь-яка сессія):
+hermes --skills skva-gatekeeper
+# > створи калькулятор
 ```
 
 ## Як це працює
