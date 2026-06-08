@@ -296,8 +296,18 @@ class ResourceManager:
                 avail_gb = psutil.virtual_memory().available / (1024**3)
                 ram_limit = max(1, int(avail_gb / 1.5))
             except ImportError:
-                # No psutil: assume 4GB available
-                ram_limit = 2
+                # Try /proc/meminfo on Linux (no psutil)
+                try:
+                    with open("/proc/meminfo") as f:
+                        for line in f:
+                            if line.startswith("MemAvailable:"):
+                                parts = line.split()
+                                avail_kb = int(parts[1])
+                                ram_limit = max(1, int(avail_kb / (1.5 * 1024 * 1024)))
+                                break
+                except (FileNotFoundError, OSError, IndexError, ValueError):
+                    # Fallback: assume 4GB available → 2 agents
+                    ram_limit = 2
             
             result = min(cpu_limit, ram_limit, self.max_cap)
             
@@ -568,6 +578,7 @@ class MarkdownAgent:
             "hermes", "chat", "-q", self.full_prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            preexec_fn=limit_resources if sys.platform != "win32" else None,
             env={**os.environ, "HERMES_HOME": HERMES_HOME,
                  "SKVA_WORK_DIR": str(work_dir)}
         )
@@ -603,22 +614,39 @@ class MarkdownAgent:
         sr_blocks = parse_search_replace_blocks(self.raw_output)
 
         if self.files:
-            # Write new files
+            # Write new files or apply SEARCH/REPLACE patches
             count = 0
             written_paths = []
+            patch_count = 0
             for path, content in self.files.items():
                 full_path = self.project_dir / path if not self.secure_workspace \
                     else self.secure_workspace.output_dir / path
                 full_path.parent.mkdir(parents=True, exist_ok=True)
-                full_path.write_text(content)
-                written_paths.append(str(path))
-                count += 1
+
+                # Detect SEARCH/REPLACE blocks inside this file's content
+                inner_sr = parse_search_replace_blocks(content)
+                if inner_sr and full_path.exists():
+                    # Apply as patch to existing file
+                    old_content = full_path.read_text()
+                    patched = apply_search_replace(old_content, inner_sr)
+                    full_path.write_text(patched)
+                    patch_count += len(inner_sr)
+                    written_paths.append(f"{path} (patch)")
+                elif inner_sr and not full_path.exists():
+                    # File doesn't exist yet — extract REPLACE content
+                    replace_only = "\n\n".join(b[1] for b in inner_sr)
+                    full_path.write_text(replace_only)
+                    count += 1
+                    written_paths.append(f"{path} (new from patch)")
+                else:
+                    # Normal full rewrite
+                    full_path.write_text(content)
+                    count += 1
+                    written_paths.append(str(path))
             self.success = True
-            log(f"✅ {self.role} ({elapsed:.0f}s) — {count} files, {len(sr_blocks)} patches")
-        elif sr_blocks:
-            # Apply patches to existing files
-            self.success = True
-            log(f"✅ {self.role} ({elapsed:.0f}s) — {len(sr_blocks)} search/replace patches")
+            log(f"✅ {self.role} ({elapsed:.0f}s) — {count} files, {patch_count} patches")
+            for p in written_paths[:3]:
+                log(f"  📄 {p}")
         else:
             lower = self.raw_output.lower()
             if any(p in lower for p in ["i cannot", "i can't", "apologize", "unable to"]):
@@ -720,7 +748,15 @@ async def run_node(node: Node, sm: StateMachine, request: str,
              "prompt": f"Спроектуй архітектуру для: {task}", "timeout": 300},
         ], project_dir)
     elif node.type == NodeType.IMPLEMENT:
-        agent = await auto_fix("developer", task, project_dir)
+        with SecureWorkspace(prefix=f"skva_{node.id}_") as ws:
+            agent = await auto_fix("developer", task, project_dir,
+                                   secure_workspace=ws)
+            # Copy generated files to project
+            if agent.success and agent.files:
+                for path, content in agent.files.items():
+                    dst = Path(project_dir) / path
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_text(content)
         agents = [agent]
     elif node.type == NodeType.REVIEW:
         agent = MarkdownAgent(
@@ -731,7 +767,15 @@ async def run_node(node: Node, sm: StateMachine, request: str,
         await agent.run()
         agents = [agent]
     elif node.type == NodeType.FIX:
-        agent = await auto_fix("developer", f"ВИПРАВ ПОМИЛКИ:\n{task}", project_dir, max_retries=2)
+        with SecureWorkspace(prefix=f"skva_{node.id}_") as ws:
+            agent = await auto_fix("developer", f"ВИПРАВ ПОМИЛКИ:\n{task}",
+                                   project_dir, max_retries=2,
+                                   secure_workspace=ws)
+            if agent.success and agent.files:
+                for path, content in agent.files.items():
+                    dst = Path(project_dir) / path
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_text(content)
         agents = [agent]
     elif node.type == NodeType.DEPLOY:
         agents = await run_parallel([
