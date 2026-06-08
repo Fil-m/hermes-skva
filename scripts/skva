@@ -13,11 +13,6 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from skva_core import (
-    solo, spawn_agent, check_gate, verify_phase,
-    log, signal_done, signal_fail, agent_heartbeat
-)
-
 def cmd_solo(request, project_dir="."):
     """Solo method — async, JSON output, Python creates files."""
     import asyncio
@@ -34,24 +29,19 @@ def cmd_doctor():
     """Діагностика системи."""
     checks = []
     
-    # Hermes
     import subprocess
     r = subprocess.run(["hermes", "--version"], capture_output=True, text=True)
     checks.append(("Hermes", r.returncode == 0, r.stdout.strip()[:50] if r.returncode == 0 else "not found"))
     
-    # Скіли
     r = subprocess.run(["hermes", "skills", "list"], capture_output=True, text=True)
     has_orch = "orchestrator" in r.stdout
     checks.append(("SKVA skills", has_orch, "orchestrator found" if has_orch else "not installed"))
     
-    # Git
     r = subprocess.run(["git", "--version"], capture_output=True, text=True)
     checks.append(("Git", r.returncode == 0, r.stdout.strip()))
     
-    # Python
     checks.append(("Python", True, sys.version.split()[0]))
     
-    # Диск
     import shutil
     total, used, free = shutil.disk_usage("/tmp")
     free_gb = free // (2**30)
@@ -74,7 +64,6 @@ def cmd_test():
     """Smoke test."""
     print("=== SKVA Test ===")
     
-    # Test 1: echo test
     print("\n1. Перевірка Hermes...")
     import subprocess
     r = subprocess.run(["hermes", "chat", "-q", "say OK"], capture_output=True, text=True, timeout=30)
@@ -84,18 +73,15 @@ def cmd_test():
         print("   ❌ Hermes не відповідає")
         return False
     
-    # Test 2: Solo test
     print("\n2. Solo метод (створення файлу)...")
     test_dir = f"/tmp/skva-test-{int(time.time())}"
     ok = cmd_solo("create a file test.txt in artifacts/fullstack/ with content HELLO", test_dir)
     print(f"   {'✅' if ok else '❌'} Solo")
     
-    # Test 3: Перевірка файлу
     test_file = f"{test_dir}/.hermes/artifacts/fullstack/test.txt"
     if os.path.exists(test_file):
         print(f"   ✅ test.txt створено")
     else:
-        # Check subdirs
         found = list(Path(test_dir).rglob("*"))
         print(f"   ⚠️ test.txt не знайдено. Файли: {[str(f.relative_to(test_dir)) for f in found[:5]]}")
     
