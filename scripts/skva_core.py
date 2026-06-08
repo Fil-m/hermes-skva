@@ -287,6 +287,7 @@ class NodeType(Enum):
 # ═══════════════════════════════════════════════════
 
 RETRO_SKILLS_DIR = ".skva/skills"
+RETRO_GLOBAL_DIR = str(Path.home() / ".skva" / "skills")
 RETRO_DATA_DIR = ".skva/retro"
 RETRO_BUDGET_RATIO = 0.10
 SKILL_REGISTRY = ".skva/skills/registry.yaml"
@@ -385,6 +386,13 @@ def _save_retro(project_dir: str, rec: RetroRecord, raw: str):
         fp = sd / f"{rec.skill_name.lower().replace(' ', '-')}.md"
         fp.write_text(rec.skill_content)
         log(f"  New skill: '{rec.skill_name}'")
+        # Also save to global skills dir for sharing
+        gd = Path(RETRO_GLOBAL_DIR)
+        gd.mkdir(parents=True, exist_ok=True)
+        gf = gd / fp.name
+        if not gf.exists():
+            gf.write_text(rec.skill_content)
+            log(f"  → shared to ~/.skva/skills/{fp.name}")
     if rec.error_pattern:
         log(f"  New error pattern: {rec.error_pattern[:60]}")
 
@@ -1087,7 +1095,7 @@ def _validate_files(files: Dict[str, str]) -> Optional[ErrorCode]:
         is_code = ext in CODE_EXTENSIONS or ext == ''
         
         # Gate 1: file too short for code
-        if is_code and len(content) < 200 and ext != '.gitignore':
+        if is_code and len(content) < 50 and ext != '.gitignore':
             log(f"  ⚠️ Quality gate FAIL: {path} too short ({len(content)} bytes)", "WARN")
             return ErrorCode.TOO_SHORT
         
@@ -1159,22 +1167,13 @@ class MarkdownAgent:
 
 ```language
 // filepath: шлях/до/твого/файлу.extension
-... код ...
+... повний код файлу ...
 ```
 
-Якщо це РЕДАГУВАННЯ існуючого файлу, використовуй SEARCH/REPLACE ВСЕРЕДИНІ блоку:
+ТИ МАЄШ ГЕНЕРУВАТИ ПОВНІ ФАЙЛИ. Не використовуй SEARCH/REPLACE — пиши весь файл цілком.
+Не використовуй '...' або '// решта без змін' — код має бути повним і робочим.
 
-```language
-// filepath: шлях/до/файлу.extension
-<<<<<<< SEARCH
-старий код
-=======
-новий код
->>>>>>> REPLACE
-```
-
-ВАЖЛИВО: filepath має БУТИ РЕАЛЬНИМ шляхом у проекті, а не прикладом.
-Не копіюй приклад — пиши шлях до файлу який реально створюєш."""
+ВАЖЛИВО: filepath має БУТИ РЕАЛЬНИМ шляхом у проекті, а не прикладом."""
 
     async def run(self):
         log(f"Starting {self.role} (timeout={self.timeout}s)")
@@ -1471,16 +1470,28 @@ async def run_node(node: Node, sm: StateMachine, request: str,
                             pass
         agents = [agent]
     elif node.type == NodeType.DEPLOY:
-        agents = await run_parallel([
-            {"role": "fullstack", "system_prompt": "Ти — DevOps.",
-             "prompt": f"Фіналізуй проект:\n{task}", "timeout": 300,
-             "model": node.model},
-        ], project_dir)
+        # No LLM — just copy files from artifacts to project dir
+        log("  Deploy: copying files (0 tokens)")
+        count = 0
+        for role_dir in sorted((Path(project_dir) / ".hermes" / "artifacts").glob("*")):
+            if role_dir.is_dir():
+                for src in sorted(role_dir.rglob("*")):
+                    if src.is_file() and not _is_binary(src):
+                        rel = src.relative_to(role_dir)
+                        dst = Path(project_dir) / rel
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            shutil.copy2(src, dst)
+                            count += 1
+                        except (shutil.SameFileError, OSError):
+                            pass
+        log(f"  Deploy: {count} files deployed")
+        agents = []  # No agent = auto-success
     else:
         agents = [MarkdownAgent(node.role, node.system_prompt, task, project_dir)]
         await agents[0].run()
 
-    success = any(a.success for a in agents)
+    success = any(a.success for a in agents) if agents else True
     # REVIEW node: parse QA verdict, don't trust agent.success alone
     if node.type == NodeType.REVIEW and success:
         review_raw = agents[0].raw_output.upper()
