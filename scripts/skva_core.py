@@ -369,6 +369,11 @@ Output YAML with skill content."""
     else:
         rec.skill_name = f"trend_analysis_{int(time.time())}"
         rec.skill_content = f"---\nname: {rec.skill_name}\ndescription: Trend research\n---\n\n{response}"
+
+    # SelfImprover: extract concrete improvements from research
+    improver = SelfImprover(project_dir)
+    await improver.generate(response, articles)
+
     return rec
 
 
@@ -1426,6 +1431,78 @@ class SkillRouter:
         return prompt + sec
 
 
+# ═══════════════════════════════════════════════════
+# SELF IMPROVER
+# ═══════════════════════════════════════════════════
+
+IMPROVEMENTS_DIR = ".skva/improvements"
+
+
+class SelfImprover:
+    def __init__(self, project_dir: str):
+        self.project_dir = Path(project_dir)
+        self.improvements_dir = self.project_dir / IMPROVEMENTS_DIR
+        self.improvements_dir.mkdir(parents=True, exist_ok=True)
+
+    async def generate(self, research_output: str, trend_articles: list) -> list:
+        prompt = f"""Generate 1-3 concrete improvements for SKVA from these tech trends.
+
+TRENDS: {' '.join(f'- {a}' for a in trend_articles[:6])}
+RESEARCH: {research_output[:2000]}
+
+Types: error_code, quality_gate, prompt_variant, dag_suggestion
+Output YAML with type, code/name, pattern/check, action.
+
+```yaml
+improvements:
+  - type: "error_code"
+    code: "E304"
+    pattern: "..."
+    action: "..."
+```"""
+        response, in_tok, out_tok = await gonka_call(prompt, timeout=90)
+        if not response:
+            return []
+        improvements = []
+        for m in re.finditer(r"type:\s*\"(.+?)\".*?(?:\n\s*\w+:\s*\"(.+?)\".*?)+?(?=\n\s*-|\Z)", response, re.DOTALL):
+            imp = {"type": m.group(1), "source": "research"}
+            for kv in re.finditer(r"(\w+):\s*\"(.+?)\"", m.group(0)):
+                imp[kv.group(1)] = kv.group(2)
+            improvements.append(imp)
+        for imp in improvements:
+            fname = re.sub(r'[^a-z0-9_.-]', '', f"{imp.get('type', 'x')}_{imp.get('code', imp.get('name', 'imp'))}.yaml".lower())
+            (self.improvements_dir / fname).write_text(json.dumps(imp, indent=2))
+        log(f"  SelfImprover: {len(improvements)} saved")
+        return improvements
+
+    def load_all(self) -> list:
+        if not self.improvements_dir.exists():
+            return []
+        imps = []
+        for f in sorted(self.improvements_dir.glob("*.yaml")):
+            try:
+                imps.append(json.loads(f.read_text()))
+            except: pass
+        return imps
+
+    def apply_one(self, imp: dict) -> bool:
+        t = imp.get("type", "")
+        if t == "error_code" and imp.get("code"):
+            if not hasattr(self, "_extra"):
+                self._extra = {}
+            self._extra[imp["code"]] = {"pattern": imp.get("pattern",""), "action": imp.get("action","")}
+            log(f"  Applied: {imp['code']} — {imp.get('pattern','')[:50]}")
+            return True
+        log(f"  Suggestion: {t} — manual review")
+        return True
+
+    def apply_all(self) -> int:
+        c = 0
+        for imp in self.load_all():
+            if self.apply_one(imp): c += 1
+        return c
+
+
 class MarkdownAgent:
     """
     Agent that uses markdown code blocks with // filepath:.
@@ -1477,6 +1554,12 @@ class MarkdownAgent:
             matched = router.match(task_prompt)
             if matched:
                 log(f"  Skills: {len(matched)} matched ({', '.join(s.name for _, s in matched)})")
+
+        # SelfImprover: apply any pending improvements
+        improver = SelfImprover(str(self.project_dir))
+        n_applied = improver.apply_all()
+        if n_applied:
+            log(f"  Improvements: {n_applied} applied")
 
         self.full_prompt = f"""{system_prompt}
 
