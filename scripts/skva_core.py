@@ -310,7 +310,86 @@ def retro_budget(report: RunReport) -> int:
     return max(1000, int(total * RETRO_BUDGET_RATIO))
 
 
-async def run_retro(report: RunReport, project_dir: str) -> RetroRecord:
+# ═══════════════════════════════════════════════════
+# RETRO SELF-IMPROVE + TREND RESEARCH
+# ═══════════════════════════════════════════════════
+
+async def retro_self_improve(project_dir: str, budget: int) -> Optional[RetroRecord]:
+    """RetroAgent improves SKVA: analyzes codebase, suggests new skills/patches."""
+    log(f"  Self-improve ({budget} tok)")
+    prompt = """You are SKVA self-improvement. Analyze SKVA architecture.
+Suggest 1 new skill (SKILL.md format) or 1 code improvement.
+Output YAML:
+```yaml
+skills:
+  - name: "..."
+    content: "---\\nname: ...\\ndescription: ...\\n---\\n..."
+```
+"""
+    response, in_tok, out_tok = await gonka_call(prompt, timeout=90)
+    if not response or len(response) < 50:
+        return None
+    rec = RetroRecord(run_id=f"self_{int(time.time())}", source="self_improve",
+                      tokens_spent=in_tok + out_tok, created_at=time.time())
+    m = re.search(r"name:\s*[\"']?(.+?)[\"']?\n\s*content:\s*[\"']?(.+?)(?:\n\s*\w+:|$)", response, re.DOTALL)
+    if m:
+        rec.skill_name, rec.skill_content = m.group(1).strip(), m.group(2).strip()
+    else:
+        rec.skill_name = f"improvement_{int(time.time())}"
+        rec.skill_content = f"---\nname: {rec.skill_name}\ndescription: Retro self-improvement\n---\n\n{response}"
+    return rec
+
+
+async def research_trends(project_dir: str, budget: int) -> Optional[RetroRecord]:
+    """Fetch tech news, analyze trends, generate progressive ideas."""
+    log(f"  Trends ({budget} tok)")
+    articles = []
+    for url in ["https://news.ycombinator.com/rss", "https://github.com/trending"]:
+        try:
+            proc = await asyncio.create_subprocess_exec("curl", "-sL", "--max-time", "15", url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+            articles.extend(re.findall(r'<title>(.+?)</title>', out.decode(errors='replace'))[:5])
+        except: continue
+    if not articles:
+        return None
+    prompt = f"""Tech trends. Generate 1 new skill for SKVA based on latest trends.
+Trends: {' '.join(f'- {a}' for a in articles[:8])}
+Output YAML with skill content."""
+    response, in_tok, out_tok = await gonka_call(prompt, timeout=90)
+    if not response:
+        return None
+    rec = RetroRecord(run_id=f"trend_{int(time.time())}", source="trend_research",
+                      tokens_spent=in_tok + out_tok, created_at=time.time())
+    m = re.search(r"name:\s*[\"']?(.+?)[\"']?\n\s*content:\s*[\"']?(.+?)(?:\n\s*\w+:|$)", response, re.DOTALL)
+    if m:
+        rec.skill_name = f"trend_{m.group(1).strip().lower().replace(' ', '_')}"
+        rec.skill_content = m.group(2).strip()
+    else:
+        rec.skill_name = f"trend_analysis_{int(time.time())}"
+        rec.skill_content = f"---\nname: {rec.skill_name}\ndescription: Trend research\n---\n\n{response}"
+    return rec
+
+
+def _save_retro(project_dir: str, rec: RetroRecord, raw: str):
+    """Save retro record and skill to disk."""
+    retro_dir = Path(project_dir) / RETRO_DATA_DIR
+    retro_dir.mkdir(parents=True, exist_ok=True)
+    (retro_dir / f"{rec.run_id}.yaml").write_text(
+        f"run_id: {rec.run_id}\nsource: {rec.source}\ntokens: {rec.tokens_spent}\n"
+        f"response: |\n  {raw.replace(chr(10), chr(10)+'  ')}\n"
+    )
+    if rec.skill_name and rec.skill_content:
+        sd = Path(project_dir) / RETRO_SKILLS_DIR
+        sd.mkdir(parents=True, exist_ok=True)
+        fp = sd / f"{rec.skill_name.lower().replace(' ', '-')}.md"
+        fp.write_text(rec.skill_content)
+        log(f"  New skill: '{rec.skill_name}'")
+    if rec.error_pattern:
+        log(f"  New error pattern: {rec.error_pattern[:60]}")
+
+
+async def run_retro(report: RunReport, project_dir: str) -> list:
     budget = retro_budget(report)
     total_tok = sum(r.total_tokens for r in report.records)
     log(f"🔄 Retro: {budget} tok budget (10% of {total_tok})")
@@ -360,7 +439,21 @@ prompts:
         log(f"Retro: new error pattern '{rec.error_pattern[:60]}' → {rec.error_action[:60]}")
     c = _gonka_estimate_cost(in_tok, out_tok)
     log(f"Retro: done ({in_tok}→{out_tok} tok, ~${c:.4f})")
-    return rec
+    results = [rec]
+
+    # Self-improve + trend research (each gets 1/3 of budget)
+    sub_budget = max(500, budget // 3)
+    self_rec = await retro_self_improve(project_dir, sub_budget)
+    if self_rec:
+        _save_retro(project_dir, self_rec, self_rec.skill_content)
+        results.append(self_rec)
+    trend_rec = await research_trends(project_dir, sub_budget)
+    if trend_rec:
+        _save_retro(project_dir, trend_rec, trend_rec.skill_content)
+        results.append(trend_rec)
+
+    log(f"Retro: {len(results)} improvements total")
+    return results
 
 
 async def discover_skills(query: str = "", max_results: int = 10) -> list:
