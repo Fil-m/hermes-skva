@@ -1,0 +1,147 @@
+method_config:
+  solo:
+    phases:
+      - name: initiation
+        roles:
+          - initiator
+        artifacts:
+          - problem_statement
+        gate: null
+        timeout: 300
+      - name: execution
+        roles:
+          - executor
+        artifacts:
+          - solution_draft
+        gate: peer_review
+        timeout: 600
+      - name: closure
+        roles:
+          - reviewer
+        artifacts:
+          - final_report
+        gate: approval
+        timeout: 180
+    default_model: gpt-4
+    timeout: 1200
+    max_retries: 2
+    gate_required: false
+
+  rada_fabryka:
+    phases:
+      - name: planning
+        roles:
+          - facilitator
+          - analyst
+        artifacts:
+          - roadmap
+          - backlog
+        gate: consensus_check
+        timeout: 900
+      - name: development
+        roles:
+          - developer
+          - tester
+        artifacts:
+          - prototype
+          - test_results
+        gate: quality_assurance
+        timeout: 1800
+      - name: review
+        roles:
+          - council_member
+        artifacts:
+          - evaluation_report
+        gate: council_approval
+        timeout: 600
+      - name: deployment
+        roles:
+          - operator
+        artifacts:
+          - deployed_solution
+        gate: operational_readiness
+        timeout: 300
+    default_model: claude-3-opus
+    timeout: 3600
+    max_retries: 3
+    gate_required: true
+
+  agile:
+    phases:
+      - name: sprint_planning
+        roles:
+          - scrum_master
+          - product_owner
+        artifacts:
+          - sprint_backlog
+        gate: sprint_goal_agreement
+        timeout: 600
+      - name: development
+        roles:
+          - developer
+          - qa_engineer
+        artifacts:
+          - user_stories
+          - code_changes
+        gate: daily_standup_check
+        timeout: 2400
+      - name: review
+        roles:
+          - team_member
+        artifacts:
+          - demo_build
+        gate: sprint_review_acceptance
+        timeout: 450
+      - name: retrospective
+        roles:
+          - scrum_master
+        artifacts:
+          - improvement_actions
+        gate: process_refinement_agreement
+        timeout: 300
+    default_model: gpt-3.5-turbo
+    timeout: 3750
+    max_retries: 4
+    gate_required: true
+
+  pipeline:
+    phases:
+      - name: ingestion
+        roles:
+          - data_engineer
+        artifacts:
+          - raw_data
+        gate: schema_validation
+        timeout: 300
+      - name: processing
+        roles:
+          - data_scientist
+        artifacts:
+          - processed_data
+        gate: data_quality_check
+        timeout: 900
+      - name: modeling
+        roles:
+          - ml_engineer
+        artifacts:
+          - model_checkpoint
+        gate: performance_threshold
+        timeout: 1800
+      - name: deployment
+        roles:
+          - mlops_engineer
+        artifacts:
+          - deployed_model
+        gate: integration_test_pass
+        timeout: 600
+      - name: monitoring
+        roles:
+          - operations
+        artifacts:
+          - performance_metrics
+        gate: stability_confirmation
+        timeout: 1200
+    default_model: gpt-4
+    timeout: 4800
+    max_retries: 3
+    gate_required: true
