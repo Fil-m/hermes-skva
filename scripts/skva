@@ -32,24 +32,26 @@ def cmd_pipeline(request, project_dir="."):
 def cmd_dag(request, project_dir="."):
     """Custom DAG from JSON file."""
     import asyncio, json
+    from pathlib import Path
     dag_file = Path(project_dir) / ".skva" / "custom_dag.json"
     if not dag_file.exists():
         print(f"❌ DAG file not found: {dag_file}")
         return False
-    from skva_core import run_dag, Node, NodeType
     with open(dag_file) as f:
-        data = json.load(f)
-    nodes = [Node(n["id"], NodeType(n["type"]), n.get("role","developer"),
-                  task_template=n.get("task","{request}"),
-                  on_success=n.get("on_success",[]),
-                  on_failure=n.get("on_failure",[]))
-             for n in data.get("nodes",[])]
-    edges = [(e["from"], e["to"], e.get("condition","success"))
-             for e in data.get("edges",[])]
-    return asyncio.run(run_dag(nodes, edges, request, str(dag_file.parent)))
+        cfg = json.load(f)
+    dag = [Node(**n) for n in cfg["nodes"]]
+    edges = [(e[0], e[1], e[2]) for e in cfg["edges"]]
+    return asyncio.run(run_dag(dag, edges, request, project_dir))
+
+
+def cmd_factory(request, project_dir="."):
+    """Modular Factory: 8+ agents parallel for large TZs."""
+    import asyncio
+    from skva_core import modular_factory
+    return asyncio.run(modular_factory(request, project_dir))
+
 
 def cmd_doctor():
-    checks = []
     import subprocess
     r = subprocess.run(["hermes", "--version"], capture_output=True, text=True)
     checks.append(("Hermes", r.returncode == 0, r.stdout.strip()[:50] if r.returncode == 0 else "not found"))
@@ -187,7 +189,7 @@ def main():
     request = sys.argv[2] if len(sys.argv) > 2 else "create a test file"
     
     methods = {"solo": cmd_solo, "rada": cmd_rada, "agile": cmd_agile,
-               "pipeline": cmd_pipeline, "dag": cmd_dag}
+               "pipeline": cmd_pipeline, "dag": cmd_dag, "factory": cmd_factory}
     
     if cmd in methods:
         methods[cmd](request, proj)
