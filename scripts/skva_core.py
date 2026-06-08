@@ -721,6 +721,7 @@ class MarkdownAgent:
                         log(f"  ⚠️ Patch failed for {path}, retrying with full rewrite", "WARN")
                         self.error = f"Patch not applied: SEARCH block not found"
                         self.error_code = ErrorCode.MALFORMED
+                        break  # Stop processing — retry via auto_fix
                     full_path.write_text(patched)
                     patch_count += len(inner_sr)
                     written_paths.append(f"{path} (patch)")
@@ -741,6 +742,10 @@ class MarkdownAgent:
                 self.success = False
                 self.error = f"Quality gate failed: {gate_error.value}"
                 self.error_code = gate_error
+                log(f"❌ {self.role} ({elapsed:.0f}s): {self.error}", "ERROR")
+            elif self.error_code:
+                # Error set during file processing (e.g. patch failure) — don't overwrite
+                self.success = False
                 log(f"❌ {self.role} ({elapsed:.0f}s): {self.error}", "ERROR")
             else:
                 self.success = True
