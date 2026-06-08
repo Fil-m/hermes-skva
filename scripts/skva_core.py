@@ -464,26 +464,6 @@ prompts:
     return results
 
 
-async def discover_skills(query: str = "", max_results: int = 10) -> list:
-    results = []
-    for source in SKILL_SOURCES:
-        url = f"https://api.github.com/repos/{source}/contents/{RETRO_SKILLS_DIR}"
-        proc = await asyncio.create_subprocess_exec("curl", "-s", url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        if proc.returncode == 0:
-            for f in (json.loads(out.decode()) if isinstance(json.loads(out.decode()), list) else []):
-                if f["name"].endswith(".md"):
-                    results.append({"name": f["name"], "path": f["path"], "url": f["download_url"], "source": source})
-    if query:
-        url = f"https://api.github.com/search/code?q={query}+path:.skva/skills/&per_page={max_results}"
-        proc = await asyncio.create_subprocess_exec("curl", "-s", url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        if proc.returncode == 0:
-            for item in json.loads(out.decode()).get("items", []):
-                results.append({"name": item["name"], "path": item["path"], "url": item["html_url"], "source": item["repository"]["full_name"]})
-    return results[:max_results]
-
-
 # ═══════════════════════════════════════════════════
 # FITNESS FUNCTION — оцінка якості запуску
 # ═══════════════════════════════════════════════════
@@ -652,6 +632,108 @@ def list_skills(project_dir: str) -> list:
         ds = re.search(r"^description:\s*(.+)$", c, re.MULTILINE)
         r.append({"name": nm.group(1).strip() if nm else f.stem, "file": str(f), "desc": ds.group(1).strip() if ds else "", "size": len(c)})
     return r
+
+
+# ═══════════════════════════════════════════════════
+# SKILLS PUSH — публікація скілів на GitHub
+# ═══════════════════════════════════════════════════
+
+SKVA_REPO_DIR = os.path.expanduser("~/hermes-skva")
+
+
+def skills_push() -> bool:
+    """Commit and push local skills to the SKVA GitHub repo."""
+    import subprocess
+    skills_dir = Path(RETRO_GLOBAL_DIR)
+    if not skills_dir.exists() or not list(skills_dir.glob("*.md")):
+        log("No skills in ~/.skva/skills/ to push", "WARN")
+        return False
+    repo = Path(SKVA_REPO_DIR)
+    if not repo.exists():
+        log(f"SKVA repo not found at {SKVA_REPO_DIR}", "WARN")
+        return False
+    repo_skills = repo / ".skva" / "skills"
+    repo_skills.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for src in skills_dir.glob("*.md"):
+        dst = repo_skills / src.name
+        if not dst.exists() or dst.read_text() != src.read_text():
+            dst.write_text(src.read_text())
+            count += 1
+    if count == 0:
+        log("No new skills to push")
+        return True
+    try:
+        subprocess.run(["git", "-C", str(repo), "add", ".skva/skills/"], capture_output=True, timeout=10)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", f"retro: {count} skills auto-synced"], capture_output=True, timeout=10)
+        push = subprocess.run(["git", "-C", str(repo), "push"], capture_output=True, text=True, timeout=30)
+        if push.returncode == 0:
+            log(f"Pushed {count} skills to GitHub")
+            return True
+        log(f"Push failed: {push.stderr[:200]}", "WARN")
+        return False
+    except subprocess.TimeoutExpired:
+        log("Git push timed out", "WARN")
+        return False
+
+
+# ═══════════════════════════════════════════════════
+# DISCOVERY — пошук скілів в зірочках та форках
+# ═══════════════════════════════════════════════════
+
+async def discover_skills(query: str = "", max_results: int = 10) -> list:
+    """Search GitHub broadly for .skva/skills/. Checks sources + GitHub search."""
+    results = []
+
+    # 1. Known sources
+    for source in SKILL_SOURCES:
+        url = f"https://api.github.com/repos/{source}/contents/.skva/skills"
+        proc = await asyncio.create_subprocess_exec("curl", "-s", url,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0:
+            files = json.loads(out.decode())
+            if isinstance(files, list):
+                for f in files:
+                    if f["name"].endswith(".md"):
+                        results.append({"name": f["name"], "url": f["download_url"],
+                                        "source": source, "from": "source"})
+
+    # 2. GitHub code search (finds any public repo with .skva/skills/)
+    search_url = "https://api.github.com/search/code?q=.skva+skills+in:path+extension:md&per_page=20"
+    proc = await asyncio.create_subprocess_exec("curl", "-s", search_url,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    if proc.returncode == 0:
+        data = json.loads(out.decode())
+        for item in data.get("items", []):
+            repo = item["repository"]["full_name"]
+            raw_url = f"https://raw.githubusercontent.com/{repo}/main/{item['path']}"
+            results.append({"name": item["name"], "url": raw_url,
+                            "source": repo, "from": "search"})
+
+    # 3. Also search by query if provided
+    if query:
+        qurl = f"https://api.github.com/search/code?q={query}+path:.skva/skills/&per_page={max_results}"
+        proc = await asyncio.create_subprocess_exec("curl", "-s", qurl,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0:
+            for item in json.loads(out.decode()).get("items", []):
+                results.append({"name": item["name"], "url": item["html_url"],
+                                "source": item["repository"]["full_name"], "from": "query"})
+
+    # Deduplicate
+    seen = set()
+    deduped = []
+    for r in results:
+        key = f"{r['name']}:{r['source']}"
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+
+    return deduped[:max_results]
+
 
 @dataclass
 class Node:

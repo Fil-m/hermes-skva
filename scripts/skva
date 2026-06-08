@@ -176,6 +176,7 @@ def main():
         print("  skva discover [запит]   — пошук скілів на GitHub")
         print("  skva import  <url>      — імпорт скілу з GitHub")
         print("  skva skills             — список локальних скілів")
+        print("  skva skills push        — опублікувати скіли на GitHub")
         print()
         print("Приклад:")
         print("  skva solo \"створи index.html\" /tmp/my-project")
@@ -215,14 +216,21 @@ def main():
             ok = asyncio.run(import_skill(sys.argv[2], os.getcwd()))
             print(f"{'✅' if ok else '❌'} Імпорт {'успішний' if ok else 'не вдався'}")
     elif cmd == "skills":
-        from skva_core import list_skills
-        skills = list_skills(os.getcwd())
-        if not skills:
-            print("Локальних скілів не знайдено")
+        if len(sys.argv) > 2 and sys.argv[2] == "push":
+            from skva_core import skills_push
+            ok = skills_push()
+            print(f"{'✅' if ok else '❌'} Push {'успішний' if ok else 'не вдався'}")
         else:
-            print(f"\nЛокальні скіли ({len(skills)}):\n")
-            for s in skills:
-                print(f"  {s['name']} — {s['desc']} ({s['size']}b)")
+            from skva_core import list_skills
+            skills = list_skills(os.getcwd())
+            if not skills:
+                print("Локальних скілів не знайдено")
+                print("  Використання: skva skills push — опублікувати на GitHub")
+            else:
+                print(f"\nЛокальні скіли ({len(skills)}):\n")
+                for s in skills:
+                    print(f"  {s['name']} — {s['desc']} ({s['size']}b)")
+                print("\n  skva skills push — опублікувати на GitHub")
     else:
         print(f"Невідома команда: {cmd}")
         print("Команди: solo, rada, agile, pipeline, dag, doctor, test")
