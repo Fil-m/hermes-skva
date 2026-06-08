@@ -1328,6 +1328,104 @@ def _validate_files(files: Dict[str, str]) -> Optional[ErrorCode]:
     return None
 
 
+# ═══════════════════════════════════════════════════
+# SKILL ROUTER
+# ═══════════════════════════════════════════════════
+
+@dataclass
+class SkillIndex:
+    name: str
+    description: str
+    tags: list
+    content: str
+    filepath: str = ""
+    source: str = "global"
+
+
+class SkillRouter:
+    def __init__(self, project_dir: str = ""):
+        self.skills = []
+        self._load_all(project_dir)
+
+    def _load_all(self, project_dir: str):
+        for base in [Path(RETRO_GLOBAL_DIR)]:
+            if base.exists():
+                for f in sorted(base.glob("*.md")):
+                    self._parse_skill(f)
+        if project_dir:
+            local = Path(project_dir) / RETRO_SKILLS_DIR
+            if local.exists():
+                for f in sorted(local.glob("*.md")):
+                    self._parse_skill(f)
+
+    def _parse_skill(self, path):
+        c = path.read_text()
+        # Fix literal \n in Gonka output
+        c = c.replace("\\n", "\n")
+        path.write_text(c)  # persist fix
+        nm = re.search(r"^name:\s*(.+)$", c, re.MULTILINE)
+        ds = re.search(r"^description:\s*(.+)$", c, re.MULTILINE)
+        tg = re.search(r"^tags:\s*\[(.+)\]$", c, re.MULTILINE)
+        tags = [t.strip().strip('"').strip("'") for t in tg.group(1).split(",")] if tg else []
+        # Auto-infer tags from description if missing
+        if not tags:
+            desc = ds.group(1).strip() if ds else path.stem
+            # Extract meaningful keywords as tags
+            words = re.findall(r"[a-zA-Zа-яіїєґ]{4,}", desc.lower())
+            # Take first 3 unique words as tags
+            seen = set()
+            for w in words:
+                if w not in seen and w not in ("this", "that", "with", "from", "the"):
+                    tags.append(w)
+                    seen.add(w)
+                    if len(tags) >= 3: break
+        self.skills.append(SkillIndex(
+            name=nm.group(1).strip() if nm else path.stem,
+            description=ds.group(1).strip() if ds else "",
+            tags=tags,
+            content=c, filepath=str(path)))
+
+    def match(self, task: str, max_r: int = 3) -> list:
+        tw = set(re.findall(r"[a-zа-яіїєґ]+", task.lower()))
+        scored = []
+        for s in self.skills:
+            sc = 0.0
+            body_lower = s.content.lower()
+            # Tag match
+            for t in s.tags:
+                if t.lower() in task.lower() or any(w in t.lower() for w in tw):
+                    sc += 0.3
+            # Body content match (fallback if no tags)
+            if not s.tags:
+                body_words = set(re.findall(r"[a-zа-яіїєґ]+", body_lower))
+                overlap = len(tw & body_words)
+                sc += overlap * 0.05
+                # Direct keyword match in content
+                for w in tw:
+                    if len(w) > 3 and w in body_lower:
+                        sc += 0.15
+            # Description match
+            dw = set(re.findall(r"[a-zа-яіїєґ]+", s.description.lower()))
+            sc += len(tw & dw) * 0.1
+            # Name match
+            nw = set(re.findall(r"[a-zа-яіїєґ]+", s.name.lower()))
+            if tw & nw: sc += 0.5
+            if sc > 0: scored.append((sc, s))
+        scored.sort(key=lambda x: -x[0])
+        return scored[:max_r]
+
+    def inject(self, prompt: str, task: str) -> str:
+        ms = self.match(task)
+        if not ms: return prompt
+        sec = "\n\n─── ДОДАТКОВІ ЗНАННЯ ───\n"
+        for sc, s in ms:
+            b = s.content
+            fm = b.find("---", 3)
+            if fm > 0: b = b[fm+3:].strip()
+            sec += f"\n📘 {s.name} (rel:{sc:.1f})\n{b[:2000]}\n"
+        return prompt + sec
+
+
 class MarkdownAgent:
     """
     Agent that uses markdown code blocks with // filepath:.
@@ -1371,6 +1469,15 @@ class MarkdownAgent:
         work_dir = secure_workspace.work_dir if secure_workspace else \
             self.project_dir / ".hermes" / "artifacts" / role
 
+        # Skill Router: inject relevant skills into prompt
+        router = SkillRouter(str(self.project_dir))
+        enriched_task = task_prompt
+        if router.skills:
+            enriched_task = router.inject(task_prompt, task_prompt)
+            matched = router.match(task_prompt)
+            if matched:
+                log(f"  Skills: {len(matched)} matched ({', '.join(s.name for _, s in matched)})")
+
         self.full_prompt = f"""{system_prompt}
 
 Твоя роль: {role}.
@@ -1378,7 +1485,7 @@ class MarkdownAgent:
 Робоча директорія: {work_dir}
 
 Завдання:
-{task_prompt}
+{enriched_task}
 
 {retry_context}
 
