@@ -2361,11 +2361,87 @@ async def run_parallel(configs, project_dir):
     try:
         await asyncio.wait_for(asyncio.gather(*[a.run() for a in agents]), timeout=600)
     except asyncio.TimeoutError:
-        print("SKVA-AUTO: Agent execution timed out after 600 seconds, cancelling tasks...")
-        for task in asyncio.all_tasks():
-            task.cancel()
-        await asyncio.gather(*[t for t in asyncio.all_tasks() if t is not asyncio.current_task()], return_exceptions=True)
+        print("SKVA-AUTO: Agent execution timed out after 600 seconds, cancelling agent tasks...")
+        # Only cancel tasks created by this function's agent run
+        agent_tasks = [asyncio.create_task(a.run()) for a in agents]
+        for task in agent_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*agent_tasks, return_exceptions=True)
     return agents
+
+
+FACTORY_MODULES = {
+    "editor": {"desc": "Pixel editor 16x16", "files": ["editor.html"]},
+    "economy": {"desc": "EVO+Gold currency", "files": ["economy.html"]},
+    "engines": {"desc": "5 game engines", "files": ["engines.html"]},
+    "shop": {"desc": "Canvas marketplace", "files": ["shop.html"]},
+    "profile": {"desc": "User profile", "files": ["profile.html"]},
+    "data": {"desc": "State manager", "files": ["data.js"]},
+}
+
+
+async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
+    import time as _t
+    project_dir = os.path.abspath(project_dir)
+    start = _t.time()
+    with open(tz_path) as f:
+        tz = f.read()
+    log(f"TZ: {len(tz)} chars")
+    chunker = DocumentChunker()
+    chunks = chunker.split(tz)
+    log(f"Chunks: {len(chunks)}")
+    summaries = []
+    for i in range(0, len(chunks), 3):
+        batch = chunks[i:i+3]
+        results = await asyncio.gather(*[
+            chunker.summarize_chunk(c, i+j, len(chunks)) for j, c in enumerate(batch)
+        ])
+        summaries.extend(results)
+    ctx = "\n".join(summaries)
+    log(f"Context: {len(ctx)} chars")
+    ap = f'Break spec into modules. JSON only: {{"modules":[{{"name":"editor","features":[]}}]}} CONTEXT: {ctx[:18000]}'
+    resp, _, _ = await gonka_call(ap, timeout=90)
+    modules = []
+    try:
+        jm = re.search(r'\{.*"modules":.*?\}', resp or "", re.DOTALL)
+        if jm: modules = json.loads(jm.group(0)).get("modules", [])
+    except: pass
+    if not modules:
+        modules = [{"name": n, "features": [v["desc"]]} for n, v in FACTORY_MODULES.items()]
+    log(f"Modules: {[m['name'] for m in modules]}")
+    sem = asyncio.Semaphore(3)
+    async def dev(mod):
+        async with sem:
+            snip = "\n".join(l[:200] for l in tz.split('\n') if mod["name"] in l.lower()[:80]) or str(mod.get("features",""))
+            p = f"Implement '{mod['name']}'. Complete HTML+CSS+JS inline. Dark theme, mobile. CONTEXT: {ctx[:5000]} SPEC: {snip[:2500]}"
+            r, it, ot = await gonka_call(p, timeout=180)
+            files = {}
+            for m in re.finditer(r"// filepath:\s*(.+?)\n(.*?)(?=```|// filepath:|\Z)", r or "", re.DOTALL):
+                files[m.group(1).strip()] = m.group(2)
+            if not files and r:
+                files[f"{mod['name']}.html"] = r[:30000]
+            return {"name": mod["name"], "files": files, "tok": it + ot}
+    results = await asyncio.gather(*[dev(m) for m in modules])
+    all_files = {}
+    for r in results:
+        for p, c in r.get("files", {}).items():
+            all_files[p] = c
+        log(f"  {r['name']}: {len(r.get('files',{}))} files, {r.get('tok',0)} tok")
+    ip = f"Create index.html integrating: {list(all_files.keys())}. Dark hub with tab nav."
+    ir, _, _ = await gonka_call(ip, timeout=90)
+    for m in re.finditer(r"```html\n(.*?)```", ir or "", re.DOTALL):
+        all_files["index.html"] = m.group(1)
+        break
+    pd = Path(project_dir)
+    pd.mkdir(parents=True, exist_ok=True)
+    c = 0
+    for p, content in all_files.items():
+        (pd / p).parent.mkdir(parents=True, exist_ok=True)
+        (pd / p).write_text(content)
+        c += 1
+    log(f"FACTORY: {_t.time()-start:.0f}s, {c} files, ~{sum(r.get('tok',0) for r in results)} tok")
+    return True
 
 
 def main():
@@ -2375,6 +2451,8 @@ def main():
 
     if cmd == "solo":
         sys.exit(0 if asyncio.run(solo(task, proj)) else 1)
+    elif cmd == "factory" or cmd == "modular":
+        sys.exit(0 if asyncio.run(modular_factory(task, proj)) else 1)
     elif cmd == "rada":
         sys.exit(0 if asyncio.run(rada_fabryka(task, proj)) else 1)
     elif cmd == "agile":

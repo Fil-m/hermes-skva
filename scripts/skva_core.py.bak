@@ -1609,6 +1609,88 @@ new code
         return self.apply_patch(result["old"], result["new"], result.get("desc", "auto"))
 
 
+# ═══════════════════════════════════════════════════
+# DOCUMENT CHUNKER — розбиття великих ТЗ/документів
+# ═══════════════════════════════════════════════════
+
+class DocumentChunker:
+    """Splits large documents into chunks, summarizes each, merges context."""
+
+    def __init__(self, max_chunk_size: int = 12000, overlap: int = 1000):
+        self.max_chunk_size = max_chunk_size
+        self.overlap = overlap
+
+    def split(self, text: str) -> list:
+        """Split text at section boundaries (## headings). Each chunk is complete sections."""
+        lines = text.split("\n")
+        chunks = []
+        current = []
+        current_size = 0
+
+        for i, line in enumerate(lines):
+            is_section = line.startswith("## ") or line.startswith("# ")
+            line_size = len(line) + 1
+
+            # If this is a new section and current chunk would overflow
+            if is_section and current_size + line_size > self.max_chunk_size and current:
+                chunks.append("\n".join(current))
+                # Overlap: keep last 2 sections
+                overlap_lines = []
+                for l in reversed(current):
+                    overlap_lines.insert(0, l)
+                    if l.startswith("## ") and len(overlap_lines) > 3:
+                        break
+                current = overlap_lines
+                current_size = sum(len(l) + 1 for l in current)
+
+            current.append(line)
+            current_size += line_size
+
+        if current:
+            chunks.append("\n".join(current))
+        return chunks
+
+    async def summarize_chunk(self, chunk: str, index: int, total: int) -> str:
+        """Send one chunk to Gonka for summarization."""
+        prompt = f"""Summarize this section of a Technical Specification (part {index+1}/{total}).
+
+Extract: key requirements, data structures, UI elements, constraints.
+Focus on what a developer needs to implement this section.
+
+```text
+{chunk[:10000]}
+```
+
+Output: concise summary in Ukrainian, max 500 chars. Focus on actionable requirements."""
+        response, in_tok, out_tok = await gonka_call(prompt, timeout=60)
+        summary = response[:1000] if response else f"[Part {index+1}/{total} — no summary]"
+        log(f"  Chunk {index+1}/{total}: {in_tok}→{out_tok} tok")
+        return f"=== ЧАСТИНА {index+1}/{total} ===\n{summary}\n"
+
+    async def process(self, text: str) -> str:
+        """Full pipeline: split → summarize chunks in parallel → merge."""
+        chunks = self.split(text)
+        log(f"📄 Document: {len(text)} chars → {len(chunks)} chunks")
+
+        if len(chunks) <= 1:
+            return text  # Small enough, use as-is
+
+        # Summarize all chunks in parallel (max 3 concurrent)
+        summaries = []
+        for i in range(0, len(chunks), 3):
+            batch = chunks[i:i+3]
+            results = await asyncio.gather(*[
+                self.summarize_chunk(c, i + j, len(chunks))
+                for j, c in enumerate(batch)
+            ])
+            summaries.extend(results)
+
+        # Merge all summaries
+        merged = "\n\n".join(summaries)
+        log(f"  Merged summary: {len(merged)} chars from {len(chunks)} chunks")
+        return merged
+
+
 class MarkdownAgent:
     """
     Agent that uses markdown code blocks with // filepath:.
@@ -1632,6 +1714,14 @@ class MarkdownAgent:
         self.run_duration = 0.0
         self.input_tokens = 0
         self.output_tokens = 0
+
+        # Document Chunker: auto-split large prompts
+        if len(task_prompt) > 15000:
+            log(f"  Large prompt ({len(task_prompt)} chars), chunking...")
+            chunker = DocumentChunker()
+            processed = asyncio.get_event_loop().run_until_complete(chunker.process(task_prompt))
+            log(f"  Chunked: {len(task_prompt)} → {len(processed)} chars")
+            task_prompt = processed
 
         # Token-aware retry context
         retry_context = ""
@@ -2268,7 +2358,13 @@ async def run_parallel(configs, project_dir):
         timeout=cfg.get("timeout", 300),
         model=cfg.get("model", "")
     ) for cfg in configs]
-    await asyncio.gather(*[a.run() for a in agents])
+    try:
+        await asyncio.wait_for(asyncio.gather(*[a.run() for a in agents]), timeout=600)
+    except asyncio.TimeoutError:
+        print("SKVA-AUTO: Agent execution timed out after 600 seconds, cancelling tasks...")
+        for task in asyncio.all_tasks():
+            task.cancel()
+        await asyncio.gather(*[t for t in asyncio.all_tasks() if t is not asyncio.current_task()], return_exceptions=True)
     return agents
 
 
