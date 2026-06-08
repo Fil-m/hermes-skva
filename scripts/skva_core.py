@@ -43,6 +43,8 @@ class RunRecord:
     error_code: str = ""
     error_message: str = ""
     started_at: float = 0.0
+    provider: str = ""
+    model_name: str = ""
 
     @property
     def total_tokens(self) -> int:
@@ -50,7 +52,6 @@ class RunRecord:
 
     @property
     def estimated_cost(self) -> float:
-        """Rough cost in USD (assumes $2/M input, $8/M output for Qwen)."""
         return (self.input_tokens * 2 + self.output_tokens * 8) / 1_000_000
 
 
@@ -179,6 +180,14 @@ class RunReport:
         _live(f"📄  Файлів створено:  {total_files}")
         _live(f"🔄  Retry:            {total_retries}")
         _live(f"🔤  Токенів:          {total_tok:,} (~${total_cost:.4f})")
+        # Cost breakdown by provider
+        provider_costs = {}
+        for r in self.records:
+            if r.provider:
+                provider_costs[r.provider] = provider_costs.get(r.provider, 0.0) + r.estimated_cost
+        if provider_costs:
+            parts = [f"{p} ${c:.4f}" for p, c in sorted(provider_costs.items())]
+            _live(f"💰  Витрати:          {' + '.join(parts)} = ${total_cost:.4f}")
         _live(f"\n📋  Деталі по фазам:")
         for rec in self.records:
             retry_info = f" (retry {rec.attempt}/{rec.max_retries})" if rec.attempt > 1 else ""
