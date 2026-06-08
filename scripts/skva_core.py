@@ -1,90 +1,448 @@
 #!/usr/bin/env python3
 """
-SKVA Core Engine v4.1 — Markdown code blocks with filepath,
-real context passing, fixed truncation, safe phase loading.
+SKVA Core Engine v5 — State DAG orchestration, Error Taxonomy,
+Search/Replace diffs, Resource Balancing, Secure Isolation.
 """
-import asyncio, json, os, sys, time, re
+import asyncio, json, os, sys, time, re, difflib
+from enum import Enum
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict, List, Optional, Callable
+import tempfile, signal, stat, shutil
 
 HERMES_HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-
 TOKEN_LIMIT = 32000
 MAX_FILE_CHARS = 5000
+SKVA_DIR = ".skva"
+
+
+# ═══════════════════════════════════════════════════
+# ERROR TAXONOMY (P5)
+# ═══════════════════════════════════════════════════
+
+class ErrorCode(Enum):
+    SYNTAX = "E100"       # Syntax error in generated code
+    IMPORT = "E101"       # Missing import/dependency
+    RUNTIME = "E102"      # Runtime exception during test
+    FILE_NOT_FOUND = "E200"   # File path doesn't exist
+    PERMISSION = "E201"   # Cannot write to path
+    MALFORMED = "E300"    # LLM output not parseable (no ``` blocks)
+    TRUNCATED = "E301"    # LLM output cut mid-block
+    TIMEOUT = "E400"      # Agent timed out
+    RESOURCE = "E401"     # Resource limit exceeded (OOM, CPU)
+    REFUSAL = "E402"      # LLM refused to generate code
+    GIT_CONFLICT = "E500" # Git merge conflict
+    UNKNOWN = "E900"      # Catch-all
+
+ERROR_STRATEGIES = {
+    ErrorCode.SYNTAX:     {"retry": True, "action": "fix_code", "agent": "developer"},
+    ErrorCode.IMPORT:     {"retry": True, "action": "fix_import", "agent": "developer"},
+    ErrorCode.RUNTIME:    {"retry": True, "action": "debug", "agent": "developer"},
+    ErrorCode.FILE_NOT_FOUND: {"retry": True, "action": "create_path", "agent": "orchestrator"},
+    ErrorCode.PERMISSION: {"retry": False, "action": "use_temp", "agent": None},
+    ErrorCode.MALFORMED:  {"retry": True, "action": "requery", "agent": "orchestrator"},
+    ErrorCode.TRUNCATED:  {"retry": True, "action": "split_and_retry", "agent": "orchestrator"},
+    ErrorCode.TIMEOUT:    {"retry": True, "action": "split_task", "agent": "orchestrator"},
+    ErrorCode.RESOURCE:   {"retry": False, "action": "throttle", "agent": None},
+    ErrorCode.REFUSAL:    {"retry": True, "action": "rephrase_prompt", "agent": "orchestrator"},
+    ErrorCode.GIT_CONFLICT: {"retry": False, "action": "manual_resolve", "agent": None},
+    ErrorCode.UNKNOWN:    {"retry": False, "action": "log_and_escalate", "agent": "mentor"},
+}
+
+
+def classify_error(error_text: str, raw_output: str = "") -> ErrorCode:
+    """Classify error text into ErrorCode."""
+    lower = (error_text + "\n" + raw_output[:2000]).lower()
+    
+    if "syntaxerror" in lower or "parseerror" in lower or "syntax error" in lower:
+        return ErrorCode.SYNTAX
+    if "modulenotfound" in lower or "importerror" in lower or "cannot find module" in lower:
+        return ErrorCode.IMPORT
+    if "refused" in lower or "cannot" in lower or "i can't" in lower or "apologize" in lower or "unable to" in lower:
+        return ErrorCode.REFUSAL
+    if "timeout" in lower or "timed out" in lower:
+        return ErrorCode.TIMEOUT
+    if "permission" in lower or "eacces" in lower:
+        return ErrorCode.PERMISSION
+    if "filenotfound" in lower or "no such file" in lower:
+        return ErrorCode.FILE_NOT_FOUND
+    if "out of memory" in lower or "oom" in lower or "memoryerror" in lower:
+        return ErrorCode.RESOURCE
+    # Check for truncation first: code block started but no closing ```
+    if "```" in raw_output:
+        open_blocks = raw_output.count("```") % 2
+        if open_blocks == 1 and len(raw_output) > 15:
+            return ErrorCode.TRUNCATED
+    if len(raw_output) < 100 and not error_text:
+        return ErrorCode.MALFORMED
+    return ErrorCode.UNKNOWN
+
+
+# ═══════════════════════════════════════════════════
+# STATE DAG (P1)
+# ═══════════════════════════════════════════════════
+
+class NodeType(Enum):
+    ANALYZE = "analyze"
+    DESIGN = "design"
+    IMPLEMENT = "implement"
+    REVIEW = "review"
+    FIX = "fix"
+    DEPLOY = "deploy"
+    DONE = "done"
+    ERROR = "error"
+
+
+@dataclass
+class Node:
+    id: str
+    type: NodeType
+    role: str              # Hermes agent role (or "system" for built-in)
+    system_prompt: str = "Ти — AI асистент."
+    task_template: str = ""  # Prompt template with {request} placeholder
+    config: Dict = field(default_factory=dict)
+    on_success: List[str] = field(default_factory=list)
+    on_failure: List[str] = field(default_factory=list)
+    interruptible: bool = True
+
+
+class StateMachine:
+    """
+    DAG-based orchestration engine.
+    State persisted to .skva/state.json (no server needed).
+    """
+    def __init__(self, project_dir: str):
+        self.project_dir = Path(project_dir)
+        self.state_dir = self.project_dir / SKVA_DIR
+        self.state_file = self.state_dir / "state.json"
+        self.nodes: Dict[str, Node] = {}
+        self.current: Optional[str] = None
+        self.history: List[Dict] = []
+        self.results: Dict[str, Dict] = {}
+        self.load()
+
+    def add_node(self, node: Node):
+        self.nodes[node.id] = node
+        self.save()
+
+    def add_edge(self, from_id: str, to_id: str, condition: str = "success"):
+        """Add transition edge. condition: 'success' or 'failure'."""
+        if from_id not in self.nodes:
+            raise KeyError(f"Node '{from_id}' not found")
+        if to_id not in self.nodes:
+            raise KeyError(f"Node '{to_id}' not found")
+        target_list = self.nodes[from_id].on_success if condition == "success" \
+                       else self.nodes[from_id].on_failure
+        if to_id not in target_list:
+            target_list.append(to_id)
+        self.save()
+
+    def transition(self, node_id: str, status: str = "success") -> Optional[str]:
+        """Move from node_id to next node based on status."""
+        node = self.nodes.get(node_id)
+        if not node:
+            return None
+        
+        candidates = node.on_success if status == "success" else node.on_failure
+        next_id = candidates[0] if candidates else None
+        
+        entry = {"from": node_id, "to": next_id, "status": status, "time": time.time()}
+        self.history.append(entry)
+        self.current = next_id
+        self.save()
+        return next_id
+
+    def get_path(self) -> List[str]:
+        """Return visited node sequence."""
+        return [step["to"] for step in self.history if step["to"]]
+
+    def save_state_result(self, node_id: str, success: bool, summary: str, 
+                          error_code: Optional[ErrorCode] = None, files: Dict = None):
+        self.results[node_id] = {
+            "success": success,
+            "summary": summary,
+            "error_code": error_code.value if error_code else None,
+            "files": list(files.keys()) if files else [],
+            "time": time.time()
+        }
+        self.save()
+
+    def reset(self):
+        """Reset state machine for new run."""
+        self.current = None
+        self.history = []
+        self.results = {}
+        self.save()
+
+    def save(self):
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        data = {
+            "current": self.current,
+            "history": self.history,
+            "results": self.results,
+            "nodes": {
+                k: {
+                    "type": n.type.value,
+                    "role": n.role,
+                    "system_prompt": n.system_prompt,
+                    "task_template": n.task_template,
+                    "config": n.config,
+                    "on_success": n.on_success,
+                    "on_failure": n.on_failure,
+                    "interruptible": n.interruptible
+                } for k, n in self.nodes.items()
+            }
+        }
+        with open(self.state_file, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def load(self):
+        if not self.state_file.exists():
+            return
+        try:
+            with open(self.state_file) as f:
+                data = json.load(f)
+            self.current = data.get("current")
+            self.history = data.get("history", [])
+            self.results = data.get("results", {})
+            for k, v in data.get("nodes", {}).items():
+                self.nodes[k] = Node(
+                    id=k,
+                    type=NodeType(v["type"]),
+                    role=v.get("role", ""),
+                    system_prompt=v.get("system_prompt", "Ти — AI асистент."),
+                    task_template=v.get("task_template", ""),
+                    config=v.get("config", {}),
+                    on_success=v.get("on_success", []),
+                    on_failure=v.get("on_failure", []),
+                    interruptible=v.get("interruptible", True)
+                )
+        except (json.JSONDecodeError, KeyError) as e:
+            log(f"⚠️ Corrupted state file: {e}", "WARN")
+
+
+# ═══════════════════════════════════════════════════
+# DIFFS POLICY (P2)
+# ═══════════════════════════════════════════════════
+
+def should_patch(old_content: str, new_content: str) -> bool:
+    """Decide whether to apply as diff or full rewrite."""
+    if not old_content or not old_content.strip():
+        return False  # New file → full write
+    old_lines = old_content.splitlines()
+    new_lines = new_content.splitlines()
+    change_ratio = abs(len(new_lines) - len(old_lines)) / max(len(old_lines), 1)
+    return len(old_lines) < 200 and change_ratio < 0.3
+
+
+def apply_search_replace(content: str, search_replace_blocks: List[tuple]) -> str:
+    """
+    Apply SEARCH/REPLACE blocks à la Aider.
+    Each block: (SEARCH_text, REPLACE_text)
+    Returns patched content.
+    """
+    result = content
+    for search, replace in search_replace_blocks:
+        if search in result:
+            result = result.replace(search, replace, 1)
+        else:
+            # Fuzzy fallback: try stripped version
+            search_stripped = search.strip()
+            if search_stripped in result:
+                result = result.replace(search_stripped, replace.strip(), 1)
+    return result
+
+
+def parse_search_replace_blocks(text: str) -> List[tuple]:
+    """
+    Parse SEARCH/REPLACE blocks from agent output.
+    Format:
+    <<<<<<< SEARCH
+    old code
+    =======
+    new code
+    >>>>>>> REPLACE
+    """
+    blocks = []
+    pattern = r'<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE'
+    for match in re.finditer(pattern, text, re.DOTALL):
+        blocks.append((match.group(1), match.group(2)))
+    return blocks
+
+
+# ═══════════════════════════════════════════════════
+# RESOURCE BALANCER (P4)
+# ═══════════════════════════════════════════════════
+
+class ResourceManager:
+    """Dynamic agent capacity based on system resources."""
+    def __init__(self, project_dir: str, max_agents_cap: int = 8):
+        self.project_dir = Path(project_dir)
+        self.history_file = self.project_dir / SKVA_DIR / "load.json"
+        self.load_history: List[Dict] = []
+        self.max_cap = max_agents_cap
+        self.load()
+
+    def get_max_concurrent(self) -> int:
+        """Calculate how many agents can run in parallel."""
+        try:
+            cpu_count = os.cpu_count() or 4
+            cpu_limit = max(1, cpu_count - 1)
+            
+            # Try psutil, fallback to simple estimate
+            ram_limit = 4  # default
+            try:
+                import psutil
+                avail_gb = psutil.virtual_memory().available / (1024**3)
+                ram_limit = max(1, int(avail_gb / 1.5))
+            except ImportError:
+                # No psutil: assume 4GB available
+                ram_limit = 2
+            
+            result = min(cpu_limit, ram_limit, self.max_cap)
+            
+            # Reduce if recent OOMs
+            recent = [e for e in self.load_history[-10:] 
+                     if e.get("event") == "oom"]
+            if len(recent) >= 2:
+                result = max(1, result - 1)
+            
+            return result
+        except Exception:
+            return 1  # Safe fallback
+
+    def update(self, active_agents: int, event: str = "tick"):
+        self.load_history.append({
+            "time": time.time(),
+            "active": active_agents,
+            "event": event
+        })
+        self.load_history = self.load_history[-100:]
+        self.save()
+
+    def save(self):
+        (self.project_dir / SKVA_DIR).mkdir(parents=True, exist_ok=True)
+        with open(self.history_file, 'w') as f:
+            json.dump(self.load_history, f)
+
+    def load(self):
+        if self.history_file.exists():
+            try:
+                with open(self.history_file) as f:
+                    self.load_history = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                self.load_history = []
+
+
+# ═══════════════════════════════════════════════════
+# ISOLATION (P3)
+# ═══════════════════════════════════════════════════
+
+class SecureWorkspace:
+    """Isolated temp workspace for agent code execution."""
+    def __init__(self, prefix="skva_agent_"):
+        self.temp_dir = Path(tempfile.mkdtemp(prefix=prefix))
+        self.temp_dir.chmod(0o700)
+        for sub in ["input", "output", "work"]:
+            (self.temp_dir / sub).mkdir()
+            (self.temp_dir / sub).chmod(0o700)
+        self._created = True
+
+    @property
+    def work_dir(self) -> Path:
+        return self.temp_dir / "work"
+
+    @property
+    def input_dir(self) -> Path:
+        return self.temp_dir / "input"
+
+    @property
+    def output_dir(self) -> Path:
+        return self.temp_dir / "output"
+
+    def cleanup(self):
+        if self._created and self.temp_dir.exists():
+            shutil.rmtree(str(self.temp_dir), ignore_errors=True)
+            self._created = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.cleanup()
+
+
+def limit_resources():
+    """Resource limits for subprocess execution (Unix)."""
+    try:
+        import resource
+        # 1.5GB memory limit per agent
+        resource.setrlimit(resource.RLIMIT_AS, (int(1.5e9), int(1.5e9)))
+        # 100MB file size limit
+        resource.setrlimit(resource.RLIMIT_FSIZE, (100*1024*1024, 100*1024*1024))
+    except (ImportError, ValueError, resource.error):
+        pass  # Not on Unix or already configured
+
+
+# ═══════════════════════════════════════════════════
+# UTILITY
+# ═══════════════════════════════════════════════════
 
 def log(msg, level="INFO"):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] [{level}] {msg}", flush=True)
 
 def count_tokens(text):
-    """Approximate token count."""
     return len(text) // 4
 
 
-# ──────────────────────────────────────────────
-# Bug #2 fix: truncation-safe markdown parser
-# ──────────────────────────────────────────────
-def _parse_filepath_blocks(text):
-    """
-    Parse // filepath: blocks from markdown code fences.
-    Handles truncated output where closing ``` is missing.
-    Returns {path: content}
-    """
-    files = {}
+# ═══════════════════════════════════════════════════
+# MARKDOWN PARSER (truncation-safe)
+# ═══════════════════════════════════════════════════
 
-    # Strategy 1: complete ```...``` blocks
+def _parse_filepath_blocks(text):
+    """Parse // filepath: from markdown code blocks. Handles truncation."""
+    files = {}
     blocks = re.findall(r'```(?:\w+)?\n(.*?)```', text, re.DOTALL)
     for block in blocks:
         _extract_filepath(block, files)
-
-    # Strategy 2: truncated block — last ``` without closing ```
+    # Truncation fallback
     lines = text.split('\n')
-    found_fence_open = False
+    found_fence = False
     block_content = []
     for line in lines:
-        if line.startswith('```') and not found_fence_open:
-            found_fence_open = True
-            block_content = []
-            continue
-        elif line.startswith('```') and found_fence_open:
-            found_fence_open = False
-            block_content = []
-            continue
-        if found_fence_open:
-            block_content.append(line)
-
-    if found_fence_open and block_content:
+        if line.startswith('```') and not found_fence:
+            found_fence = True; block_content = []; continue
+        elif line.startswith('```') and found_fence:
+            found_fence = False; block_content = []; continue
+        if found_fence: block_content.append(line)
+    if found_fence and block_content:
         remaining = '\n'.join(block_content)
         if re.search(r'(?://|#|<!--)\s*filepath:\s*\S+', remaining):
             _extract_filepath(remaining, files)
-
     return files
 
 
 def _extract_filepath(block, files_dict):
-    """Extract filepath from a single block content."""
     match = re.search(r'(?://|#|<!--)\s*filepath:\s*([^\n]+)', block)
     if match:
         path = match.group(1).strip()
-        content_start = block.find(match.group(0)) + len(match.group(0))
-        content = block[content_start:].strip()
-        if content.endswith('```'):
-            content = content[:-3].strip()
+        start = block.find(match.group(0)) + len(match.group(0))
+        content = block[start:].strip()
+        if content.endswith('```'): content = content[:-3].strip()
         files_dict[path] = content
 
 
 def _parse_no_fence_filepath(text):
-    """Fallback: standalone filepath lines (no code fence)."""
     files = {}
     lines = text.split('\n')
-    current_path = None
-    current_content = []
+    current_path = None; current_content = []
     for line in lines:
-        fp_match = re.match(r'\s*(?://|#|<!--)\s*filepath:\s*(\S+)', line)
-        if fp_match:
+        fp = re.match(r'\s*(?://|#|<!--)\s*filepath:\s*(\S+)', line)
+        if fp:
             if current_path and current_content:
                 files[current_path] = '\n'.join(current_content)
-            current_path = fp_match.group(1).strip()
-            current_content = []
+            current_path = fp.group(1).strip(); current_content = []
         elif current_path:
             current_content.append(line)
     if current_path and current_content:
@@ -92,91 +450,72 @@ def _parse_no_fence_filepath(text):
     return files
 
 
-# ──────────────────────────────────────────────
-# Bug #4 fix: safe load_phase_context
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════
+# AGENT CORE
+# ═══════════════════════════════════════════════════
+
 BINARY_EXTENSIONS = frozenset({
-    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp',
-    '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar',
-    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-    '.woff', '.woff2', '.ttf', '.eot', '.otf',
-    '.mp3', '.mp4', '.avi', '.mov', '.wav', '.ogg',
-    '.pyc', '.pyo', '.pyd', '.so', '.dll', '.dylib',
-    '.exe', '.msi', '.bin', '.o', '.a', '.lib',
+    '.png','.jpg','.jpeg','.gif','.bmp','.ico','.webp',
+    '.zip','.tar','.gz','.bz2','.xz','.7z','.rar',
+    '.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx',
+    '.woff','.woff2','.ttf','.eot','.otf',
+    '.mp3','.mp4','.avi','.mov','.wav','.ogg',
+    '.pyc','.pyo','.pyd','.so','.dll','.dylib',
+    '.exe','.msi','.bin','.o','.a','.lib',
 })
-
-SKIP_DIRS = frozenset({'node_modules', '.git', '__pycache__', '.venv', 'venv', 'dist', 'build', '.next', '.turbo', 'target'})
-
+SKIP_DIRS = frozenset({'node_modules','.git','__pycache__','.venv','venv','dist','build','.next','.turbo','target'})
 
 def _is_binary(path):
     return Path(path).suffix.lower() in BINARY_EXTENSIONS
 
 
 def load_phase_context(project_dir, phase, max_chars=12000):
-    """Load artifacts from a phase with char limit.
-    Safe: skips binary files, node_modules, .git, __pycache__.
-    """
     phase_dir = Path(project_dir) / ".hermes" / "artifacts" / phase
     if not phase_dir.exists():
         return ""
-
-    parts = []
-    total = 0
+    parts = []; total = 0
     for f in sorted(phase_dir.rglob("*")):
-        if not f.is_file():
+        if not f.is_file() or _is_binary(f) or f.stat().st_size == 0:
             continue
-        if _is_binary(f):
+        rel = str(f.relative_to(phase_dir))
+        if any(skip in rel.split(os.sep) for skip in SKIP_DIRS):
             continue
-        rel = f.relative_to(phase_dir)
-        parts_str = str(rel)
-        if any(skip in parts_str.split(os.sep) for skip in SKIP_DIRS):
-            continue
-        if f.stat().st_size == 0:
-            continue
-
         remaining = max_chars - total
-        if remaining <= 0:
-            break
-
+        if remaining <= 0: break
         try:
             text = f.read_text(errors='replace')[:remaining]
         except (UnicodeDecodeError, PermissionError, OSError):
             continue
-
         parts.append(f"--- {rel} ---\n{text}")
         total += len(text)
-
     return "\n\n".join(parts)
 
 
-# ──────────────────────────────────────────────
-# Core: MarkdownAgent
-# ──────────────────────────────────────────────
 class MarkdownAgent:
-    """Agent using markdown code blocks with // filepath: annotation."""
-
-    def __init__(self, role, system_prompt, task_prompt, project_dir, timeout=300,
-                 previous_code="", previous_error=""):
+    """
+    Agent that uses markdown code blocks with // filepath:.
+    v5: returns structured result with ErrorCode.
+    """
+    def __init__(self, role, system_prompt, task_prompt, project_dir, 
+                 timeout=300, previous_code="", previous_error="",
+                 secure_workspace: Optional[SecureWorkspace] = None):
         self.role = role
         self.project_dir = Path(project_dir)
         self.timeout = timeout
         self.success = False
         self.error = ""
+        self.error_code: Optional[ErrorCode] = None
         self.files = {}
         self.summary = ""
         self.raw_output = ""
+        self.secure_workspace = secure_workspace
 
-        # Bug #3 fix: dynamic token-aware retry context
+        # Token-aware retry context
         retry_context = ""
         if previous_code:
             pc_tokens = count_tokens(previous_code)
             budget = min(TOKEN_LIMIT, 3000)
-            if pc_tokens > budget:
-                truncated_code = previous_code[-budget*4:]
-                log(f"retry context truncated {pc_tokens} -> {budget} tokens")
-            else:
-                truncated_code = previous_code
-
+            truncated_code = previous_code[-budget*4:] if pc_tokens > budget else previous_code
             retry_context = f"""
 Попередня версія коду (має помилку):
 {truncated_code}
@@ -187,13 +526,14 @@ class MarkdownAgent:
 ВИПРАВ ЦЕЙ КОД. Не генеруй наново — виправ конкретну помилку.
 """
 
-        artifacts_dir = self.project_dir / ".hermes" / "artifacts" / role
+        work_dir = secure_workspace.work_dir if secure_workspace else \
+            self.project_dir / ".hermes" / "artifacts" / role
 
         self.full_prompt = f"""{system_prompt}
 
 Твоя роль: {role}.
 Проект: {self.project_dir}
-Директорія: {artifacts_dir}
+Робоча директорія: {work_dir}
 
 Завдання:
 {task_prompt}
@@ -201,34 +541,35 @@ class MarkdownAgent:
 {retry_context}
 
 ВАЖЛИВО — формат відповіді:
-Для КОЖНОГО файлу, який треба створити, використовуй такий формат:
-
+Для КОЖНОГО файлу, який треба створити:
 ```language
-// filepath: relative/path/to/file.extension
-// content of the file
+// filepath: relative/path/file.ext
+// content
 ```
 
-Наприклад:
-```javascript
-// filepath: src/index.html
-<!DOCTYPE html>
-<html><body>Hello</body></html>
-```
+Якщо ТРЕБА ВІДРЕДАГУВАТИ існуючий файл, використовуй SEARCH/REPLACE:
+<<<<<<< SEARCH
+старий код
+=======
+новий код
+>>>>>>> REPLACE
 
-Наприкінці напиши короткий підсумок.
-Не додавай JSON. Не додавай пояснень до коду. Тільки код в блоках."""
+Наприкінці напиши короткий підсумок."""
 
     async def run(self):
         log(f"Starting {self.role} (timeout={self.timeout}s)")
         start = time.time()
-
-        (self.project_dir / ".hermes" / "artifacts" / self.role).mkdir(parents=True, exist_ok=True)
+        
+        work_dir = self.secure_workspace.work_dir if self.secure_workspace \
+            else self.project_dir / ".hermes" / "artifacts" / self.role
+        work_dir.mkdir(parents=True, exist_ok=True)
 
         proc = await asyncio.create_subprocess_exec(
             "hermes", "chat", "-q", self.full_prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "HERMES_HOME": HERMES_HOME}
+            env={**os.environ, "HERMES_HOME": HERMES_HOME,
+                 "SKVA_WORK_DIR": str(work_dir)}
         )
 
         output_lines = []
@@ -238,56 +579,384 @@ class MarkdownAgent:
                     line = await asyncio.wait_for(proc.stdout.readline(), timeout=self.timeout)
                 except asyncio.TimeoutError:
                     proc.kill()
-                    self.error = f"timeout after {self.timeout}s"
+                    self.error = "timeout"
+                    self.error_code = ErrorCode.TIMEOUT
                     break
                 if not line:
                     break
                 output_lines.append(line.decode(errors='replace'))
-
             self.raw_output = "".join(output_lines)
-            stderr_data = (await proc.stderr.read()).decode(errors='replace')
-            rc = proc.returncode
+            await proc.stderr.read()
         except Exception as e:
             proc.kill()
             self.error = str(e)
             self.raw_output = "".join(output_lines)
-            stderr_data = ""
-            rc = -1
 
         elapsed = time.time() - start
 
-        # Bug #2 fix: truncation-safe parsing
+        # Parse output
         self.files = _parse_filepath_blocks(self.raw_output)
         if not self.files:
             self.files = _parse_no_fence_filepath(self.raw_output)
 
-        # Write files
+        # Also parse SEARCH/REPLACE blocks
+        sr_blocks = parse_search_replace_blocks(self.raw_output)
+
         if self.files:
+            # Write new files
             count = 0
             written_paths = []
             for path, content in self.files.items():
-                full_path = self.project_dir / path
+                full_path = self.project_dir / path if not self.secure_workspace \
+                    else self.secure_workspace.output_dir / path
                 full_path.parent.mkdir(parents=True, exist_ok=True)
                 full_path.write_text(content)
                 written_paths.append(str(path))
                 count += 1
             self.success = True
-            log(f"✅ {self.role} ({elapsed:.0f}s) — {count} files")
-            for p in written_paths[:3]:
-                log(f"  📄 {p}")
+            log(f"✅ {self.role} ({elapsed:.0f}s) — {count} files, {len(sr_blocks)} patches")
+        elif sr_blocks:
+            # Apply patches to existing files
+            self.success = True
+            log(f"✅ {self.role} ({elapsed:.0f}s) — {len(sr_blocks)} search/replace patches")
         else:
             lower = self.raw_output.lower()
             if any(p in lower for p in ["i cannot", "i can't", "apologize", "unable to"]):
                 self.error = "LLM refused"
+                self.error_code = ErrorCode.REFUSAL
             elif len(self.raw_output) < 50:
                 self.error = "empty response"
+                self.error_code = ErrorCode.MALFORMED
             else:
-                self.error = "no // filepath: blocks found"
+                self.error = "no // filepath: blocks or SEARCH/REPLACE found"
+                self.error_code = ErrorCode.MALFORMED
                 debug_path = self.project_dir / ".hermes" / "artifacts" / self.role / "_raw_output.txt"
                 debug_path.write_text(self.raw_output[:10000])
-            log(f"❌ {self.role} ({elapsed:.0f}s): {self.error}", "ERROR")
+            log(f"❌ {self.role} ({elapsed:.0f}s): {self.error} [{self.error_code}]", "ERROR")
 
         return self
+
+
+def _build_retry_context(files_dict, error_msg, budget=4000):
+    """Token-aware retry context builder."""
+    if not files_dict:
+        return error_msg
+    sorted_files = sorted(files_dict.items(), key=lambda x: len(x[1]))
+    parts = []; total = 0
+    for path, content in sorted_files:
+        available = min(len(content), MAX_FILE_CHARS)
+        remaining = budget * 4 - total
+        if remaining <= 0: break
+        chunk = content[:min(available, remaining)]
+        parts.append(f"=== {path} ===\n{chunk}")
+        total += len(chunk)
+    code_block = "\n\n".join(parts)
+    return f"{code_block}\n\nПомилка:\n{error_msg}" if error_msg else code_block
+
+
+async def auto_fix(role, task_prompt, project_dir, max_retries=3,
+                   secure_workspace=None):
+    """Auto-fix with error taxonomy and retry strategies."""
+    previous_code = ""
+    previous_error = ""
+    
+    for attempt in range(1, max_retries + 1):
+        log(f"  {role} attempt {attempt}/{max_retries}")
+
+        agent = MarkdownAgent(
+            role, "Ти — Developer. Пиши код.",
+            task_prompt, project_dir, timeout=300,
+            previous_code=previous_code, previous_error=previous_error,
+            secure_workspace=secure_workspace
+        )
+        await agent.run()
+
+        if agent.success:
+            return agent
+
+        # Use error taxonomy to decide retry strategy
+        ec = agent.error_code or classify_error(agent.error, agent.raw_output)
+        strategy = ERROR_STRATEGIES.get(ec, ERROR_STRATEGIES[ErrorCode.UNKNOWN])
+        
+        if not strategy["retry"]:
+            log(f"  ❌ Non-retryable error {ec.value}, giving up")
+            return agent
+
+        if attempt < max_retries:
+            log(f"  🔄 Retryable {ec.value}, strategy={strategy['action']}")
+            previous_code = ""
+            if agent.files:
+                previous_code = _build_retry_context(agent.files, agent.error)
+            previous_error = f"[{ec.value}] {agent.error}"
+
+    return agent
+
+
+# ═══════════════════════════════════════════════════
+# WORKFLOW ENGINE (DAG-based)
+# ═══════════════════════════════════════════════════
+
+async def run_node(node: Node, sm: StateMachine, request: str, 
+                   project_dir: str, resources: ResourceManager) -> bool:
+    """Execute a single DAG node and transition."""
+    log(f"🏗 DAG node: {node.id} ({node.type.value})")
+    
+    task = node.task_template.format(request=request) if node.task_template else request
+    context = load_phase_context(project_dir, node.id)
+    if context:
+        task = f"{task}\n\nКонтекст:\n{context}"
+
+    max_parallel = resources.get_max_concurrent()
+    log(f"  Capacity: {max_parallel} concurrent agents")
+
+    if node.type == NodeType.ANALYZE:
+        agents = await run_parallel([
+            {"role": "analyst", "system_prompt": "Ти — Systems Analyst.",
+             "prompt": f"Збери вимоги для: {task}", "timeout": 300},
+        ], project_dir)
+    elif node.type == NodeType.DESIGN:
+        agents = await run_parallel([
+            {"role": "architect", "system_prompt": "Ти — Software Architect.",
+             "prompt": f"Спроектуй архітектуру для: {task}", "timeout": 300},
+        ], project_dir)
+    elif node.type == NodeType.IMPLEMENT:
+        agent = await auto_fix("developer", task, project_dir)
+        agents = [agent]
+    elif node.type == NodeType.REVIEW:
+        agent = MarkdownAgent(
+            "qa", "Ти — QA Engineer. Перевір код на помилки.",
+            f"Проведи code review. Знайди мінімум 3 проблеми:\n{task}",
+            project_dir, timeout=300
+        )
+        await agent.run()
+        agents = [agent]
+    elif node.type == NodeType.FIX:
+        agent = await auto_fix("developer", f"ВИПРАВ ПОМИЛКИ:\n{task}", project_dir, max_retries=2)
+        agents = [agent]
+    elif node.type == NodeType.DEPLOY:
+        agents = await run_parallel([
+            {"role": "fullstack", "system_prompt": "Ти — DevOps.",
+             "prompt": f"Фіналізуй проект:\n{task}", "timeout": 300},
+        ], project_dir)
+    else:
+        agents = [MarkdownAgent(node.role, node.system_prompt, task, project_dir)]
+        await agents[0].run()
+
+    success = any(a.success for a in agents)
+    errors = [a.error for a in agents if not a.success]
+    error_code = None
+    if errors:
+        raw = "\n".join(a.raw_output for a in agents if not a.success)
+        error_code = classify_error(errors[0], raw)
+
+    # Save result
+    sm.save_state_result(
+        node.id, success,
+        summary=errors[0] if errors else "ok",
+        error_code=error_code,
+        files={k: v for a in agents for k, v in a.files.items()}
+    )
+
+    # Transition
+    status = "success" if success else "failure"
+    next_node = sm.transition(node.id, status)
+    
+    if next_node and next_node != node.id:
+        log(f"  ➡️ {node.id} → {next_node} ({status})")
+        if next_node == "error":
+            log(f"  ❌ Entered ERROR state")
+            return False
+        next_n = sm.nodes.get(next_node)
+        if next_n and next_n.type != NodeType.DONE:
+            return await run_node(next_n, sm, request, project_dir, resources)
+
+    return success
+
+
+async def run_dag(workflow_nodes: List[Node], edges: List[tuple],
+                  request: str, project_dir: str) -> bool:
+    """
+    Run a custom DAG workflow.
+    workflow_nodes: list of Node objects
+    edges: list of (from_id, to_id, condition) tuples
+    """
+    project_dir = os.path.abspath(project_dir)
+    sm = StateMachine(project_dir)
+    sm.reset()
+    
+    for node in workflow_nodes:
+        sm.add_node(node)
+    for from_id, to_id, condition in edges:
+        sm.add_edge(from_id, to_id, condition)
+
+    resources = ResourceManager(project_dir)
+    start = time.time()
+
+    start_node = workflow_nodes[0].id if workflow_nodes else None
+    if not start_node:
+        log("❌ No start node in workflow", "ERROR")
+        return False
+
+    log(f"🏁 DAG start: {start_node}")
+    ok = await run_node(sm.nodes[start_node], sm, request, project_dir, resources)
+    log(f"🏁 DAG done ({time.time()-start:.0f}s): {'✅' if ok else '❌'}")
+    return ok
+
+
+# ═══════════════════════════════════════════════════
+# PREDEFINED WORKFLOWS
+# ═══════════════════════════════════════════════════
+
+def build_solo_dag() -> List[Node]:
+    """Solo method as DAG: single IMPLEMENT node."""
+    return [
+        Node("impl", NodeType.IMPLEMENT, "fullstack",
+             system_prompt="Ти — Fullstack Developer.",
+             task_template="{request}",
+             on_success=["done"]),
+        Node("done", NodeType.DONE, "", on_success=[]),
+    ]
+
+
+def build_rada_dag() -> List[Node]:
+    """Rada+Fabryka: ANALYZE → IMPLEMENT → DEPLOY"""
+    return [
+        Node("analyze", NodeType.ANALYZE, "analyst",
+             task_template="{request}",
+             on_success=["implement"],
+             on_failure=["error"]),
+        Node("implement", NodeType.IMPLEMENT, "developer",
+             task_template="{request}",
+             on_success=["deploy"],
+             on_failure=["fix"]),
+        Node("fix", NodeType.FIX, "developer",
+             task_template="{request}",
+             on_success=["deploy"],
+             on_failure=["error"]),
+        Node("deploy", NodeType.DEPLOY, "fullstack",
+             task_template="{request}",
+             on_success=["done"],
+             on_failure=["error"]),
+        Node("done", NodeType.DONE, ""),
+        Node("error", NodeType.ERROR, ""),
+    ]
+
+
+def build_agile_dag() -> List[Node]:
+    """Agile: DESIGN → IMPLEMENT → REVIEW → (FIX|DONE)"""
+    return [
+        Node("design", NodeType.DESIGN, "architect",
+             task_template="{request}",
+             on_success=["implement"],
+             on_failure=["error"]),
+        Node("implement", NodeType.IMPLEMENT, "developer",
+             task_template="{request}",
+             on_success=["review"],
+             on_failure=["fix"]),
+        Node("review", NodeType.REVIEW, "qa",
+             task_template="{request}",
+             on_success=["done"],
+             on_failure=["fix"]),
+        Node("fix", NodeType.FIX, "developer",
+             task_template="ВИПРАВ ПОМИЛКИ:\n{request}",
+             on_success=["review"],
+             on_failure=["error"]),
+        Node("done", NodeType.DONE, ""),
+        Node("error", NodeType.ERROR, ""),
+    ]
+
+
+def build_pipeline_dag() -> List[Node]:
+    """Pipeline: ANALYZE → DESIGN → IMPLEMENT → REVIEW → DEPLOY"""
+    return [
+        Node("analyze", NodeType.ANALYZE, "analyst",
+             task_template="{request}",
+             on_success=["design"], on_failure=["error"]),
+        Node("design", NodeType.DESIGN, "architect",
+             task_template="{request}",
+             on_success=["implement"], on_failure=["error"]),
+        Node("implement", NodeType.IMPLEMENT, "developer",
+             task_template="{request}",
+             on_success=["review"], on_failure=["fix"]),
+        Node("review", NodeType.REVIEW, "qa",
+             task_template="{request}",
+             on_success=["deploy"], on_failure=["fix"]),
+        Node("fix", NodeType.FIX, "developer",
+             task_template="ВИПРАВ ПОМИЛКИ:\n{request}",
+             on_success=["review"], on_failure=["error"]),
+        Node("deploy", NodeType.DEPLOY, "fullstack",
+             task_template="{request}",
+             on_success=["done"], on_failure=["error"]),
+        Node("done", NodeType.DONE, ""),
+        Node("error", NodeType.ERROR, ""),
+    ]
+
+
+# ═══════════════════════════════════════════════════
+# API (backward compatible)
+# ═══════════════════════════════════════════════════
+
+async def solo(request, project_dir="."):
+    """Solo: one agent (uses DAG internally)."""
+    project_dir = os.path.abspath(project_dir)
+    dag = build_solo_dag()
+    edges = [("impl", "done", "success")]
+    return await run_dag(dag, edges, request, project_dir)
+
+
+async def rada_fabryka(request, project_dir="."):
+    """Rada+Fabryka: analysis → implement → deploy (DAG-based)."""
+    project_dir = os.path.abspath(project_dir)
+    dag = build_rada_dag()
+    edges = [
+        ("analyze", "implement", "success"),
+        ("analyze", "error", "failure"),
+        ("implement", "deploy", "success"),
+        ("implement", "fix", "failure"),
+        ("fix", "deploy", "success"),
+        ("fix", "error", "failure"),
+        ("deploy", "done", "success"),
+        ("deploy", "error", "failure"),
+    ]
+    return await run_dag(dag, edges, request, project_dir)
+
+
+async def agile(request, project_dir="."):
+    """Agile: design → implement → review → (fix|done)."""
+    project_dir = os.path.abspath(project_dir)
+    dag = build_agile_dag()
+    edges = [
+        ("design", "implement", "success"),
+        ("design", "error", "failure"),
+        ("implement", "review", "success"),
+        ("implement", "fix", "failure"),
+        ("review", "done", "success"),
+        ("review", "fix", "failure"),
+        ("fix", "review", "success"),
+        ("fix", "error", "failure"),
+    ]
+    return await run_dag(dag, edges, request, project_dir)
+
+
+async def pipeline(request, project_dir="."):
+    """Full pipeline: analyze → design → implement → review → deploy."""
+    project_dir = os.path.abspath(project_dir)
+    dag = build_pipeline_dag()
+    edges = [
+        ("analyze", "design", "success"),
+        ("analyze", "error", "failure"),
+        ("design", "implement", "success"),
+        ("design", "error", "failure"),
+        ("implement", "review", "success"),
+        ("implement", "fix", "failure"),
+        ("review", "deploy", "success"),
+        ("review", "fix", "failure"),
+        ("fix", "review", "success"),
+        ("fix", "error", "failure"),
+        ("deploy", "done", "success"),
+        ("deploy", "error", "failure"),
+    ]
+    return await run_dag(dag, edges, request, project_dir)
 
 
 async def run_parallel(configs, project_dir):
@@ -302,122 +971,6 @@ async def run_parallel(configs, project_dir):
     return agents
 
 
-# ──────────────────────────────────────────────
-# Bug #3 fix: token-aware retry context builder
-# ──────────────────────────────────────────────
-def _build_retry_context(files_dict, error_msg, budget=4000):
-    """Build retry context with token-aware allocation across files."""
-    if not files_dict:
-        return error_msg
-
-    sorted_files = sorted(files_dict.items(), key=lambda x: len(x[1]))
-    parts = []
-    total_chars = 0
-
-    for path, content in sorted_files:
-        available = min(len(content), MAX_FILE_CHARS)
-        remaining = budget * 4 - total_chars
-        if remaining <= 0:
-            break
-        chunk = content[:min(available, remaining)]
-        parts.append(f"=== {path} ===\n{chunk}")
-        total_chars += len(chunk)
-
-    code_block = "\n\n".join(parts)
-    if error_msg:
-        return f"{code_block}\n\nПомилка:\n{error_msg}"
-    return code_block
-
-
-async def auto_fix(role, task_prompt, project_dir, max_retries=3):
-    """Auto-fix with REAL context passing and token-aware allocation."""
-    previous_code = ""
-    previous_error = ""
-
-    for attempt in range(1, max_retries + 1):
-        log(f"  {role} attempt {attempt}/{max_retries}")
-
-        agent = MarkdownAgent(
-            role, "Ти — Developer. Пиши код.",
-            task_prompt, project_dir, timeout=300,
-            previous_code=previous_code,
-            previous_error=previous_error
-        )
-        await agent.run()
-
-        if agent.success:
-            return agent
-
-        previous_code = ""
-        if agent.files:
-            previous_code = _build_retry_context(agent.files, agent.error)
-        previous_error = agent.error
-
-    return agent
-
-
-async def solo(request, project_dir="."):
-    project_dir = os.path.abspath(project_dir)
-    log(f"=== SOLO: {request} ===")
-    start = time.time()
-
-    agent = MarkdownAgent(
-        "fullstack", "Ти — Fullstack Developer.",
-        request, project_dir, timeout=900
-    )
-    await agent.run()
-
-    elapsed = time.time() - start
-    if agent.success:
-        log(f"✅ SOLO ({elapsed:.0f}s) — {len(agent.files)} files")
-    else:
-        log(f"❌ SOLO ({elapsed:.0f}s): {agent.error}", "ERROR")
-    return agent.success
-
-
-async def council(request, project_dir):
-    log("=== COUNCIL ===")
-    agents = await run_parallel([
-        {"role": "architect", "system_prompt": "Ти — Software Architect.",
-         "prompt": f"Спроектуй архітектуру для: {request}", "timeout": 300},
-        {"role": "analyst", "system_prompt": "Ти — Systems Analyst.",
-         "prompt": f"Збери вимоги для: {request}", "timeout": 300},
-    ], project_dir)
-
-    ok = any(a.success for a in agents)
-    if ok:
-        (Path(project_dir) / ".hermes" / "signals" / ".council.done").touch()
-    return ok
-
-
-async def factory(request, project_dir):
-    log("=== FACTORY ===")
-    context = load_phase_context(project_dir, "council")
-    task = f"{request}\n\nКонтекст:\n{context}" if context else request
-
-    agent = await auto_fix("developer", task, project_dir, max_retries=3)
-
-    if agent.success:
-        (Path(project_dir) / ".hermes" / "signals" / ".factory.done").touch()
-    return agent.success
-
-
-async def rada_fabryka(request, project_dir="."):
-    project_dir = os.path.abspath(project_dir)
-    for d in [".hermes/signals", ".hermes/artifacts/council", ".hermes/artifacts/factory/src"]:
-        os.makedirs(f"{project_dir}/{d}", exist_ok=True)
-
-    start = time.time()
-    log("🏗 Rada+Fabryka")
-
-    if not await council(request, project_dir):
-        return False
-
-    ok = await factory(request, project_dir)
-    log(f"🏗 DONE ({time.time()-start:.0f}s)")
-    return ok
-
-
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     task = sys.argv[2] if len(sys.argv) > 2 else "create hello"
@@ -427,8 +980,19 @@ def main():
         sys.exit(0 if asyncio.run(solo(task, proj)) else 1)
     elif cmd == "rada":
         sys.exit(0 if asyncio.run(rada_fabryka(task, proj)) else 1)
+    elif cmd == "agile":
+        sys.exit(0 if asyncio.run(agile(task, proj)) else 1)
+    elif cmd == "pipeline":
+        sys.exit(0 if asyncio.run(pipeline(task, proj)) else 1)
     else:
-        print("SKVA v4.1\nsolo 'task' [dir]\nrada 'task' [dir]")
+        print("SKVA v5 — DAG-based multi-agent orchestration")
+        print()
+        print("  skva solo     \"запит\"  — Solo (1 agent)")
+        print("  skva rada     \"запит\"  — Rada+Fabryka (analyze→implement→deploy)")
+        print("  skva agile    \"запит\"  — Agile (design→implement→review→fix)")
+        print("  skva pipeline \"запит\"  — Full pipeline (+analyze, +deploy)")
+        print("  skva doctor             — діагностика")
+        print("  skva test               — smoke test")
 
 if __name__ == "__main__":
     main()

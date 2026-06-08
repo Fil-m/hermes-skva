@@ -1,31 +1,105 @@
 ---
 name: skva-orchestrator
-description: "SKVA — Оркестратор. Приймає запит, обирає метод, формує команду, моніторить, доставляє."
-version: 1.0.0
+description: "SKVA v5 — Оркестратор. State DAG, Error Taxonomy, Diffs, Resource Balancing, Isolation."
+version: 5.0.0
 author: "Fil-m"
-tags: [skva, orchestrator, production, multi-agent]
+tags: [skva, orchestrator, dag, multi-agent, v5]
 platforms: [linux, macos, wsl]
 ---
 
-# SKVA — Система Колективної Взаємодії Агентів Hermes
+# SKVA v5 — Оркестратор (State DAG)
 
-## Принцип роботи
+## Архітектура
 
-Ти — Оркестратор. Користувач дає тобі задачу. Ти:
-1. Аналізуєш задачу і обираєш метод виробництва
-2. Формуєш команду агентів (через terminal(background=true))
-3. Моніториш виконання (heartbeat, gates)
-4. Верифікуєш результат
-5. Доставляєш користувачу
+SKVA v5 замінює лінійний конвеєр (Council→Factory) на **State DAG**:
+кожен етап — окрема нода графа, транзиції залежать від статусу (success/failure).
 
-## Методи виробництва
+```
+ANALYZE ─success→ DESIGN ─success→ IMPLEMENT ─success→ REVIEW ─success→ DEPLOY ─success→ DONE
+  │                   │                    │                 │                │
+  └─failure→ ERROR    └─failure→ ERROR     └─failure→ FIX    └─failure→ FIX   └─failure→ ERROR
+                                                │
+                                                └─success→ REVIEW
+```
 
-| Метод | Коли | Час | Агентів |
-|-------|------|-----|---------|
-| Solo | Фікси, дрібні задачі | < 15 хв | 1 |
-| Rada+Fabryka | Нові проекти | < 60 хв | 4-5 |
-| Agile Team | Великі проекти | спринти | 3-5 |
-| Pipeline | Конвеєр | < 45 хв | 4 |
+## Компоненти v5
+
+| Компонент | Файл | Призначення |
+|-----------|------|-------------|
+| StateMachine | `skva_core.py:StateMachine` | DAG-оркестрація, JSON persistence |
+| ErrorCode | `skva_core.py:ErrorCode` | 12 кодів помилок + стратегії |
+| classify_error | `skva_core.py:classify_error` | Автокласифікація помилок LLM |
+| should_patch | `skva_core.py:should_patch` | Diffs vs Full rewrite policy |
+| parse_search_replace_blocks | `skva_core.py` | Парсер Aider-формату |
+| ResourceManager | `skva_core.py:ResourceManager` | Динамічний capacity |
+| SecureWorkspace | `skva_core.py:SecureWorkspace` | temp-ізоляція + rlimit |
+| MarkdownAgent | `skva_core.py:MarkdownAgent` | spawn-ить Hermes з v5 форматом |
+
+## Методи виробництва (всі DAG-based)
+
+| Команда | DAG ноди | Коли |
+|---------|----------|------|
+| `skva solo` | IMPLEMENT→DONE | Фікси, дрібні задачі |
+| `skva rada` | ANALYZE→IMPLEMENT→DEPLOY | Нові проекти |
+| `skva agile` | DESIGN→IMPLEMENT→REVIEW→FIX | Ітеративна розробка |
+| `skva pipeline` | ANALYZE→DESIGN→IMPLEMENT→REVIEW→DEPLOY | Повний конвеєр |
+| `skva dag` | Custom DAG з `.skva/custom_dag.json` | Кастомні workflow |
+
+## Error Taxonomy
+
+| Код | Причина | Retry? | Стратегія |
+|-----|---------|--------|-----------|
+| E100 | Syntax error | ✅ | fix_code |
+| E101 | Import error | ✅ | fix_import |
+| E102 | Runtime exception | ✅ | debug |
+| E200 | File not found | ✅ | create_path |
+| E300 | Malformed output | ✅ | requery |
+| E301 | Truncated output | ✅ | split_and_retry |
+| E400 | Timeout | ✅ | split_task |
+| E401 | Resource limit | ❌ | throttle |
+| E402 | LLM refusal | ✅ | rephrase_prompt |
+| E500 | Git conflict | ❌ | manual_resolve |
+
+## Search/Replace Diffs
+
+Агенти можуть повертати два формати:
+1. **Full rewrite**: ```` ``` // filepath: path/file.ext ``` ````
+2. **Patch (Aider format)**: `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE`
+
+`should_patch()` вирішує: patch якщо <200 рядків і <30% зміни.
+
+## Resource Balancing
+
+`get_max_concurrent() = min(cpu_count-1, free_ram/1.5GB, max_cap)`
+
+Зберігається в `.skva/load.json`. Перераховується при кожному spawn.
+Якщо 2+ OOM події за останні 10 — зменшує capacity на 1.
+
+## Стан проекту
+
+DAG стан зберігається в `.skva/state.json`:
+- Поточний node, історія транзицій, результати кожної ноди
+- Можна перервати і продовжити (recover)
+
+## Використання
+
+```bash
+# Solo
+skva solo "створи index.html з Hello World"
+
+# Agile з code review
+skva agile "react todo app з localStorage"
+
+# Pipeline повний
+skva pipeline "python cli tool для парсингу csv"
+
+# Кастомний DAG (створи .skva/custom_dag.json)
+skva dag "створи api"
+
+# Діагностика
+skva doctor
+skva test
+```
 
 ## Алгоритм вибору методу
 
@@ -33,95 +107,10 @@ platforms: [linux, macos, wsl]
 def select_method(request):
     words = len(request.split())
     if words < 50 and any(kw in request for kw in ["fix", "баг", "пофікси"]):
-        return "Solo"
-    if any(kw in request for kw in ["pipeline", "ci", "cd"]):
-        return "Pipeline"
-    if any(kw in request for kw in ["спринт", "ітерація", "проект"]):
-        return "Agile Team"
-    return "Rada+Fabryka"
-```
-
-## Фаза 0: Ідеація (Brain Dump)
-
-Перед запуском Ради — збери ідею:
-
-1. Розшир ідею через ШІ (що типово для такого проекту?)
-2. Запитай користувача: "Додати ці базові вимоги?"
-3. Попроси 2-3 user stories: "Опиши сценарії використання"
-4. Перевір достатність:
-
-| Критерій | Перевірка |
-|----------|-----------|
-| Тип проекту зрозумілий | "гра", "сайт", "застосунок" |
-| Мінімум 3 вимоги | функціональні + нефункціональні |
-| Мінімум 2 user stories | "як гравець, я хочу..." |
-| Користувач підтвердив | "так", "давай", "ок" |
-
-5. Максимум 5 раундів уточнень
-6. Після підтвердження → запускай Council
-
-## Фаза 1: Council (Рада)
-
-Запусти файл-форум для обговорення:
-
-```python
-# Проста дискусія (2-3 ролі)
-terminal(background=True, command=f"""
-hermes chat -q 'Ти — модератор Ради.
-Команда: Architect, Analyst.
-Задача: {user_request}
-Кожен пише позицію в .hermes/artifacts/council/
-Результат: arch.md, spec.md, consensus.md'
-""", workdir=project_path)
-
-# Складна дискусія (Pairs+Judge)
-# Ролі: Architect vs DevOps, Analyst vs Developer
-# Суддя: Mentor
-```
-
-## Фаза 2: Factory (Фабрика)
-
-```python
-terminal(background=True, command=f"""
-hermes chat -q 'Ти — Developer.
-Прочитай spec з .hermes/artifacts/council/
-Пиши код в .hermes/artifacts/factory/src/
-Heartbeat кожні 60с в signals/heartbeat/dev.live
-Коли готово — touch signals/.factory.done'
-""", workdir=project_path)
-```
-
-## Фаза 3: Верифікація
-
-```python
-# Перевірити що код компілюється
-result = terminal(f"cd {project_path}/artifacts/factory && npm run build", timeout=60)
-if result.exit_code != 0:
-    touch(f"{project_path}/signals/.factory.fail")
-```
-
-## Фаза 4: Deploy
-
-```bash
-cd {project_path}/artifacts/factory
-npm run build
-npx gh-pages -d build
-echo "https://user.github.io/{project_name}" > ../deploy/url.txt
-```
-
-## Доставка
-
-```python
-send_telegram(f"✅ Проект готовий!\nПосилання: {url}\nЧас: {duration}")
-```
-
-## Resource Balancing
-
-```python
-import subprocess
-cores = int(subprocess.getoutput("nproc"))
-free_ram = int(subprocess.getoutput("free -m | awk 'NR==2{print $7}'")) // 1024
-max_agents = min(cores, free_ram // 2, 4)
-max_agents = max(max_agents, 1)
-# max_agents — скільки агентів можна запустити паралельно
+        return "solo"
+    if any(kw in request for kw in ["pipeline", "ci/cd", "деплой"]):
+        return "pipeline"
+    if any(kw in request for kw in ["спринт", "ітерація", "рев'ю"]):
+        return "agile"
+    return "rada"
 ```
