@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Колобок: Втеча з Лабіринту</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a1a2e;color:#eee;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh}
+.game-container{background:#16213e;border-radius:16px;padding:20px;box-shadow:0 0 40px rgba(0,0,0,.5)}
+h1{text-align:center;color:#ffd700;font-size:24px;margin-bottom:12px;text-shadow:0 0 10px rgba(255,215,0,.3)}
+.game-layout{display:flex;gap:20px;align-items:flex-start}
+.legend{background:#0f3460;border-radius:12px;padding:14px;width:160px;font-size:13px}
+.legend h3{color:#ffd700;margin-bottom:8px;font-size:14px}
+.legend-item{display:flex;align-items:center;gap:8px;margin:4px 0;padding:3px 6px;border-radius:4px}
+.legend-item .swatch{width:20px;height:20px;border-radius:4px;border:1px solid rgba(255,255,255,.2);flex-shrink:0}
+canvas{border:2px solid #0f3460;border-radius:8px;display:block;cursor:pointer}
+.stats-bar{display:flex;justify-content:space-between;margin-top:10px;padding:8px 12px;background:#0f3460;border-radius:8px;font-size:14px}
+.stats-bar span{color:#aaa}
+.stats-bar .val{color:#fff;font-weight:bold}
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);justify-content:center;align-items:center;z-index:100}
+.modal-overlay.show{display:flex}
+.modal{background:#16213e;border-radius:16px;padding:30px;text-align:center;max-width:400px;border:2px solid #ffd700;animation:pulse .5s}
+@keyframes pulse{0%{transform:scale(.8);opacity:0}100%{transform:scale(1);opacity:1}}
+.modal h2{font-size:28px;margin-bottom:10px}
+.modal p{margin:8px 0;color:#ccc;font-size:15px}
+.modal .btn{display:inline-block;margin-top:16px;padding:10px 30px;background:#ffd700;color:#1a1a2e;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;transition:.2s}
+.modal .btn:hover{transform:scale(1.05);background:#ffed4a}
+.speed-indicator{padding:3px 8px;border-radius:4px;font-size:12px;font-weight:bold}
+.speed-fast{background:#2e7d32;color:#c8e6c9}
+.speed-med{background:#f57f17;color:#fff9c4}
+.speed-slow{background:#b71c1c;color:#ffcdd2}
+.speed-ice{background:#00838f;color:#b2ebf2}
+</style>
+</head>
+<body>
+<div class="game-container">
+  <h1>🍞 Колобок: Втеча з Лабіринту</h1>
+  <div class="game-layout">
+    <div class="legend">
+      <h3>🗺️ Поверхні</h3>
+      <div class="legend-item"><div class="swatch" style="background:#C4956A"></div> Доріжка ×1</div>
+      <div class="legend-item"><div class="swatch" style="background:#4CAF50"></div> Трава ×3</div>
+      <div class="legend-item"><div class="swatch" style="background:#2196F3"></div> Болото ×6</div>
+      <div class="legend-item"><div class="swatch" style="background:#80DEEA"></div> Лід ×2 🧊</div>
+      <div class="legend-item"><div class="swatch" style="background:#37474F"></div> Стіна</div>
+      <div class="legend-item"><div class="swatch" style="background:#FFD700"></div> 🏁 Вихід</div>
+      <hr style="border-color:#0f3460;margin:8px 0">
+      <div style="font-size:12px;color:#888">
+        <div style="display:flex;align-items:center;gap:6px;margin:3px 0"><div style="width:16px;height:16px;border-radius:50%;background:#FFD700;flex-shrink:0"></div> Колобок</div>
+        <div style="display:flex;align-items:center;gap:6px;margin:3px 0"><div style="width:0;height:0;border-left:8px solid transparent;border-right:8px solid transparent;border-bottom:14px solid #e53935;flex-shrink:0"></div> Бабуся</div>
+        <div style="display:flex;align-items:center;gap:6px;margin:3px 0"><div style="width:16px;height:2px;background:#ffd700;border-top:2px dashed #ffd700;flex-shrink:0"></div> Маршрут A*</div>
+      </div>
+      <hr style="border-color:#0f3460;margin:8px 0">
+      <div style="font-size:12px;color:#888">⌨️ WASD / Стрілки</div>
+    </div>
+    <div>
+      <canvas id="game" width="800" height="640"></canvas>
+      <div class="stats-bar">
+        <span>👣 Кроків: <span class="val" id="steps">0</span></span>
+        <span>⏱️ Час: <span class="val" id="time">0с</span></span>
+        <span>🏃 Швидкість: <span class="val"><span id="speedDisplay" class="speed-indicator speed-fast">Доріжка ×1</span></span></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="winModal">
+  <div class="modal">
+    <h2>🎉 Колобок втік!</h2>
+    <p id="winStats">Кроків: 0 · Час: 0с</p>
+    <p style="font-size:13px;color:#888">Колобок знайшов вихід з лабіринту!</p>
+    <button class="btn" onclick="restartGame()">🔄 Ще раз</button>
+  </div>
+</div>
+<div class="modal-overlay" id="loseModal">
+  <div class="modal">
+    <h2>😱 Бабуся спіймала Колобка!</h2>
+    <p id="loseStats">Протримався: 0 кроків · 0с</p>
+    <p style="font-size:13px;color:#888">Спробуй обрати кращий маршрут!</p>
+    <button class="btn" onclick="restartGame()">🔄 Спробувати знову</button>
+  </div>
+</div>
+
+<script>
+const COLS=20, ROWS=15, CELL=40;
+const canvas=document.getElementById('game');
+const ctx=canvas.getContext('2d');
+
+// 0=path,1=wall,2=grass,3=swamp,4=ice,5=exit
+const MAZE=[
+[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+[1,0,0,2,0,0,0,1,0,0,0,0,4,0,0,0,0,0,0,1],
+[1,0,1,1,1,0,1,1,0,1,1,0,1,1,0,1,1,1,0,1],
+[1,2,0,3,0,0,0,0,0,0,2,0,0,0,0,0,3,0,0,1],
+[1,1,0,1,1,0,1,0,1,0,1,1,0,1,1,1,0,1,0,1],
+[1,0,0,0,2,0,1,0,0,0,0,2,0,0,0,0,0,1,0,1],
+[1,0,1,1,0,0,1,0,1,1,0,1,1,1,0,1,0,1,0,1],
+[1,0,0,4,0,0,0,0,0,2,0,0,0,4,0,1,0,0,0,1],
+[1,1,1,1,0,1,1,0,1,1,1,0,1,1,0,1,0,1,0,1],
+[1,0,0,0,0,0,2,0,0,0,0,0,0,3,0,0,0,1,0,1],
+[1,0,1,0,1,1,1,1,1,0,1,1,1,0,1,1,1,1,0,1],
+[1,0,1,0,0,3,0,0,0,0,0,0,3,0,0,0,0,0,0,1],
+[1,0,1,1,0,1,1,0,1,1,1,0,1,1,0,1,0,1,0,1],
+[1,5,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,0,1],
+[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+];
+
+const TERRAIN={
+  0:{name:'Доріжка',color:'#C4956A',weight:1,cls:'speed-fast'},
+  1:{name:'Стіна',color:'#37474F',weight:Infinity},
+  2:{name:'Трава',color:'#4CAF50',weight:3,cls:'speed-med'},
+  3:{name:'Болото',color:'#2196F3',weight:6,cls:'speed-slow'},
+  4:{name:'Лід',color:'#80DEEA',weight:2,cls:'speed-ice',slippery:true},
+  5:{name:'Вихід',color:'#FFD700',weight:1,cls:'speed-fast'}
+};
+
+let px=1, py=1, gx=18, gy=13, ex=1, ey=13;
+let steps=0, startTime=0, gameOver=false, won=false;
+let lastDir={dx:0,dy:0};
+
+function getWeight(cx,cy){return TERRAIN[MAZE[cy]?.[cx]]?.weight??Infinity}
+
+function aStar(sx,sy,tex,tey){
+  const open=[], closed=new Set(), cameFrom={}, gScore={}, fScore={};
+  const key=(x,y)=>`${x},${y}`;
+  const h=(x,y)=>Math.abs(x-tex)+Math.abs(y-tey);
+  open.push({x:sx,y:sy,f:0});
+  gScore[key(sx,sy)]=0;
+  fScore[key(sx,sy)]=h(sx,sy);
+  while(open.length){
+    open.sort((a,b)=>a.f-b.f);
+    const{ x,y}=open.shift();
+    if(x===tex&&y===tey){
+      const path=[]; let c=key(tex,tey);
+      while(cameFrom[c]){const[x,y]=c.split(',').map(Number);path.unshift({x,y});c=cameFrom[c]}
+      path.unshift({x:sx,y:sy});
+      return path;
+    }
+    closed.add(key(x,y));
+    for(const[dx,dy] of[[0,1],[0,-1],[1,0],[-1,0]]){
+      const nx=x+dx, ny=y+dy;
+      if(nx<0||nx>=COLS||ny<0||ny>=ROWS||closed.has(key(nx,ny)))continue;
+      const w=getWeight(nx,ny);
+      if(w===Infinity)continue;
+      const tentG=(gScore[key(x,y)]||0)+w;
+      if(tentG<(gScore[key(nx,ny)]||Infinity)){
+        cameFrom[key(nx,ny)]=key(x,y);
+        gScore[key(nx,ny)]=tentG;
+        fScore[key(nx,ny)]=tentG+h(nx,ny);
+        if(!open.some(o=>o.x===nx&&o.y===ny))
+          open.push({x:nx,y:ny,f:fScore[key(nx,ny)]});
+      }
+    }
+  }
+  return null;
+}
+
+function draw(){
+  ctx.clearRect(0,0,800,640);
+  // Grid
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    const t=MAZE[r][c];
+    ctx.fillStyle=TERRAIN[t]?.color||'#555';
+    ctx.fillRect(c*CELL,r*CELL,CELL,CELL);
+    ctx.strokeStyle='rgba(0,0,0,.2)';
+    ctx.strokeRect(c*CELL,r*CELL,CELL,CELL);
+    // Exit marker
+    if(t===5){ctx.fillStyle='rgba(255,215,0,.15)';ctx.fillRect(c*CELL+2,r*CELL+2,CELL-4,CELL-4);}
+  }
+  // A* path
+  const path=gameOver?null:aStar(px,py,ex,ey);
+  if(path){
+    ctx.setLineDash([4,4]);
+    ctx.strokeStyle='rgba(255,215,0,.6)';
+    ctx.lineWidth=2.5;
+    ctx.beginPath();
+    for(let i=0;i<path.length;i++){
+      const{x,y}=path[i];
+      const cx2=x*CELL+CELL/2,cy2=y*CELL+CELL/2;
+      i===0?ctx.moveTo(cx2,cy2):ctx.lineTo(cx2,cy2);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Weighted distance
+    let totalW=0;
+    for(let i=0;i<path.length;i++){
+      const{x,y}=path[i];
+      if(i>0&&!(x===px&&y===py))totalW+=getWeight(x,y);
+    }
+    // Stats
+    ctx.fillStyle='rgba(0,0,0,.5)';
+    ctx.fillRect(4,4,190,22);
+    ctx.fillStyle='#ffd700';
+    ctx.font='12px sans-serif';
+    ctx.fillText(`🛤️ A* вага: ${totalW} · кроків: ${path.length-1}`,8,18);
+  }
+  // Grandma
+  const head=gy*CELL+CELL/2, gx2=gx*CELL+CELL/2;
+  ctx.fillStyle='#e53935';
+  ctx.beginPath();
+  ctx.moveTo(gx2,head-12);
+  ctx.lineTo(gx2-10,head+6);
+  ctx.lineTo(gx2+10,head+6);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle='#fff';
+  ctx.beginPath();ctx.arc(gx2-3,head-4,2,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.arc(gx2+3,head-4,2,0,Math.PI*2);ctx.fill();
+  // Kolobok
+  const kx=px*CELL+CELL/2,ky=py*CELL+CELL/2;
+  ctx.shadowColor='#ffd700';
+  ctx.shadowBlur=12;
+  ctx.beginPath();ctx.arc(kx,ky,14,0,Math.PI*2);ctx.fillStyle='#FFD700';ctx.fill();
+  ctx.shadowBlur=0;
+  ctx.fillStyle='#333';
+  ctx.beginPath();ctx.arc(kx-5,ky-3,3,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.arc(kx+5,ky-3,3,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#333';
+  ctx.beginPath();ctx.arc(kx-2,ky+4,3,0,Math.PI);ctx.fill();
+  ctx.beginPath();ctx.arc(kx+2,ky+4,3,0,Math.PI);ctx.fill();
+}
+
+function movePlayer(dx,dy){
+  if(gameOver)return;
+  const nx=px+dx, ny=py+dy;
+  if(nx<0||nx>=COLS||ny<0||ny>=ROWS)return;
+  const w=getWeight(nx,ny);
+  if(w===Infinity)return;
+  px=nx;py=ny;
+  steps++;
+  lastDir={dx,dy};
+  // Ice slide
+  const t=MAZE[ny][nx];
+  if(t===4&&dx+dy!==0){
+    const sx=nx+dx, sy=ny+dy;
+    if(sx>=0&&sx<COLS&&sy>=0&&sy<ROWS&&getWeight(sx,sy)!==Infinity){
+      px=sx;py=sy;
+    }
+  }
+  // Check win
+  if(MAZE[py][px]===5){won=true;gameOver=true;showWin();draw();return;}
+  // Grandma moves every 2 steps
+  if(steps%2===0)moveGrandma();
+  updateStats();
+  draw();
+  // Check lose
+  if(px===gx&&py===gy){gameOver=true;showLose();draw();}
+}
+
+function moveGrandma(){
+  const path=aStar(gx,gy,px,py);
+  if(path&&path.length>1){
+    gx=path[1].x; gy=path[1].y;
+  }
+}
+
+function updateStats(){
+  const elapsed=Math.floor((Date.now()-startTime)/1000);
+  document.getElementById('steps').textContent=steps;
+  document.getElementById('time').textContent=elapsed+'с';
+  const t=MAZE[py]?.[px];
+  const info=TERRAIN[t];
+  if(info){
+    const sd=document.getElementById('speedDisplay');
+    sd.textContent=`${info.name} ×${info.weight}`;
+    sd.className=`speed-indicator ${info.cls||'speed-fast'}`;
+  }
+}
+
+function showWin(){
+  const elapsed=Math.floor((Date.now()-startTime)/1000);
+  document.getElementById('winStats').textContent=`Кроків: ${steps} · Час: ${elapsed}с`;
+  document.getElementById('winModal').classList.add('show');
+}
+function showLose(){
+  const elapsed=Math.floor((Date.now()-startTime)/1000);
+  document.getElementById('loseStats').textContent=`Протримався: ${steps} кроків · ${elapsed}с`;
+  document.getElementById('loseModal').classList.add('show');
+}
+
+function restartGame(){
+  document.getElementById('winModal').classList.remove('show');
+  document.getElementById('loseModal').classList.remove('show');
+  px=1;py=1;gx=18;gy=13;steps=0;gameOver=false;won=false;startTime=Date.now();
+  lastDir={dx:0,dy:0};
+  updateStats();
+  draw();
+}
+
+document.addEventListener('keydown',e=>{
+  const k=e.key;
+  if(k==='w'||k==='ArrowUp')movePlayer(0,-1);
+  else if(k==='s'||k==='ArrowDown')movePlayer(0,1);
+  else if(k==='a'||k==='ArrowLeft')movePlayer(-1,0);
+  else if(k==='d'||k==='ArrowRight')movePlayer(1,0);
+  else if(k==='r'||k==='R')restartGame();
+  if(['w','a','s','d','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(k))
+    e.preventDefault();
+});
+
+// Init
+startTime=Date.now();
+updateStats();
+draw();
+</script>
+</body>
+</html>

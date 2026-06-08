@@ -32,6 +32,8 @@ class ErrorCode(Enum):
     RESOURCE = "E401"     # Resource limit exceeded (OOM, CPU)
     REFUSAL = "E402"      # LLM refused to generate code
     GIT_CONFLICT = "E500" # Git merge conflict
+    TOO_SHORT = "E302"    # Generated file too short (< 200 bytes for code)
+    PLACEHOLDER = "E303"  # File contains placeholder markers (TODO, ...код...)
     UNKNOWN = "E900"      # Catch-all
 
 ERROR_STRATEGIES = {
@@ -46,6 +48,8 @@ ERROR_STRATEGIES = {
     ErrorCode.RESOURCE:   {"retry": False, "action": "throttle", "agent": None},
     ErrorCode.REFUSAL:    {"retry": True, "action": "rephrase_prompt", "agent": "orchestrator"},
     ErrorCode.GIT_CONFLICT: {"retry": False, "action": "manual_resolve", "agent": None},
+    ErrorCode.TOO_SHORT:   {"retry": True, "action": "regenerate", "agent": "developer"},
+    ErrorCode.PLACEHOLDER: {"retry": True, "action": "regenerate_no_placeholders", "agent": "developer"},
     ErrorCode.UNKNOWN:    {"retry": False, "action": "log_and_escalate", "agent": "mentor"},
 }
 
@@ -100,6 +104,7 @@ class Node:
     role: str              # Hermes agent role (or "system" for built-in)
     system_prompt: str = "Ти — AI асистент."
     task_template: str = ""  # Prompt template with {request} placeholder
+    model: str = ""        # Model override: "" = default, "qwen3-235b", "deepseek-v4", etc.
     config: Dict = field(default_factory=dict)
     on_success: List[str] = field(default_factory=list)
     on_failure: List[str] = field(default_factory=list)
@@ -189,7 +194,8 @@ class StateMachine:
                     "config": n.config,
                     "on_success": n.on_success,
                     "on_failure": n.on_failure,
-                    "interruptible": n.interruptible
+                    "interruptible": n.interruptible,
+                    "model": n.model
                 } for k, n in self.nodes.items()
             }
         }
@@ -215,7 +221,8 @@ class StateMachine:
                     config=v.get("config", {}),
                     on_success=v.get("on_success", []),
                     on_failure=v.get("on_failure", []),
-                    interruptible=v.get("interruptible", True)
+                    interruptible=v.get("interruptible", True),
+                    model=v.get("model", "")
                 )
         except (json.JSONDecodeError, KeyError) as e:
             log(f"⚠️ Corrupted state file: {e}", "WARN")
@@ -526,6 +533,37 @@ def load_phase_context(project_dir, phase, max_chars=12000):
     return "\n\n".join(parts)
 
 
+CODE_EXTENSIONS = frozenset({'.py','.js','.ts','.jsx','.tsx','.html','.css','.java',
+                             '.go','.rs','.rb','.php','.c','.cpp','.h','.hpp','.swift',
+                             '.kt','.scala','.sh','.bash','.yaml','.yml','.toml','.sql'})
+
+PLACEHOLDER_PATTERNS = re.compile(
+    r'(?:TODO|FIXME|XXX)\s*:|\.\.\.\s*код\s*\.\.\.|\.\.\.\s*code\s*\.\.\.|'
+    r'решта\s*коду\s*без\s*змін|rest\s*of\s*the\s*code|'
+    r'//\s*\.\.\.|#\s*\.\.\.|<!--\s*\.\.\.|'
+    r'повторити\s*логіку|same\s*logic\s*as\s*above',
+    re.IGNORECASE
+)
+
+def _validate_files(files: Dict[str, str]) -> Optional[ErrorCode]:
+    """Quality gate: validate generated files. Returns ErrorCode if gate fails."""
+    for path, content in files.items():
+        ext = Path(path).suffix.lower()
+        is_code = ext in CODE_EXTENSIONS or ext == ''
+        
+        # Gate 1: file too short for code
+        if is_code and len(content) < 200 and ext != '.gitignore':
+            log(f"  ⚠️ Quality gate FAIL: {path} too short ({len(content)} bytes)", "WARN")
+            return ErrorCode.TOO_SHORT
+        
+        # Gate 2: placeholder markers
+        if is_code and PLACEHOLDER_PATTERNS.search(content):
+            log(f"  ⚠️ Quality gate FAIL: {path} contains placeholder markers", "WARN")
+            return ErrorCode.PLACEHOLDER
+    
+    return None
+
+
 class MarkdownAgent:
     """
     Agent that uses markdown code blocks with // filepath:.
@@ -533,7 +571,8 @@ class MarkdownAgent:
     """
     def __init__(self, role, system_prompt, task_prompt, project_dir, 
                  timeout=300, previous_code="", previous_error="",
-                 secure_workspace: Optional[SecureWorkspace] = None):
+                 secure_workspace: Optional[SecureWorkspace] = None,
+                 model: str = ""):
         self.role = role
         self.project_dir = Path(project_dir)
         self.timeout = timeout
@@ -672,10 +711,18 @@ class MarkdownAgent:
                     full_path.write_text(content)
                     count += 1
                     written_paths.append(str(path))
-            self.success = True
-            log(f"✅ {self.role} ({elapsed:.0f}s) — {count} files, {patch_count} patches")
-            for p in written_paths[:3]:
-                log(f"  📄 {p}")
+            # Quality Gate: validate files before declaring success
+            gate_error = _validate_files(self.files)
+            if gate_error:
+                self.success = False
+                self.error = f"Quality gate failed: {gate_error.value}"
+                self.error_code = gate_error
+                log(f"❌ {self.role} ({elapsed:.0f}s): {self.error}", "ERROR")
+            else:
+                self.success = True
+                log(f"✅ {self.role} ({elapsed:.0f}s) — {count} files, {patch_count} patches")
+                for p in written_paths[:3]:
+                    log(f"  📄 {p}")
         else:
             lower = self.raw_output.lower()
             if any(p in lower for p in ["i cannot", "i can't", "apologize", "unable to"]):
@@ -906,10 +953,12 @@ def build_rada_dag() -> List[Node]:
              on_failure=["error"]),
         Node("implement", NodeType.IMPLEMENT, "developer",
              task_template="{request}",
+             model="qwen3-235b",
              on_success=["deploy"],
              on_failure=["fix"]),
         Node("fix", NodeType.FIX, "developer",
              task_template="{request}",
+             model="qwen3-235b",
              on_success=["deploy"],
              on_failure=["error"]),
         Node("deploy", NodeType.DEPLOY, "fullstack",
