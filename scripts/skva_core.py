@@ -484,6 +484,145 @@ async def discover_skills(query: str = "", max_results: int = 10) -> list:
     return results[:max_results]
 
 
+# ═══════════════════════════════════════════════════
+# FITNESS FUNCTION — оцінка якості запуску
+# ═══════════════════════════════════════════════════
+
+FITNESS_WEIGHTS = {
+    "token_efficiency": 0.30,  # токенів на рядок коду
+    "file_quality": 0.25,      # пройшло quality gates
+    "retry_count": 0.20,       # менше retry = краще
+    "completion_speed": 0.15,  # швидкість на файл
+    "error_severity": 0.10,    # E100 vs E900
+}
+FITNESS_HISTORY = ".skva/fitness_history.yaml"
+
+
+def calculate_fitness(report: RunReport) -> dict:
+    """Calculate fitness score 0.0-1.0 from a completed run report."""
+    scores = {}
+    total_tok = sum(r.total_tokens for r in report.records) or 1
+    total_files = sum(r.files_written for r in report.records)
+    total_retries = sum(1 for r in report.records if r.attempt > 1)
+    total_time = sum(r.duration for r in report.records) or 1
+
+    # 1. Token efficiency: tokens per file (lower is better)
+    tok_per_file = total_tok / max(total_files, 1)
+    # 0 files = 0, 5000 tok/file = 0.5, 500 tok/file = 0.95
+    scores["token_efficiency"] = 1.0 / (1.0 + tok_per_file / 5000)
+
+    # 2. File quality: how many files passed quality gates
+    failed = sum(1 for r in report.records if r.status == "failed")
+    scores["file_quality"] = max(0, 1.0 - failed / max(len(report.records), 1))
+
+    # 3. Retry count: 0 retries = 1.0, 5 retries = 0.5
+    scores["retry_count"] = 1.0 / (1.0 + total_retries)
+
+    # 4. Completion speed: time per file (lower is better)
+    sec_per_file = total_time / max(total_files, 1)
+    scores["completion_speed"] = 1.0 / (1.0 + sec_per_file / 60)
+
+    # 5. Error severity: weighted by error code
+    severity = 0.0
+    for rec in report.records:
+        if rec.error_code:
+            code_num = int(rec.error_code[1:]) if rec.error_code[1:].isdigit() else 900
+            severity += code_num / 900
+    scores["error_severity"] = max(0, 1.0 - severity / max(len(report.records), 1))
+
+    # Weighted total
+    total = sum(scores[k] * FITNESS_WEIGHTS[k] for k in FITNESS_WEIGHTS)
+    scores["total"] = round(total, 4)
+    scores["tokens"] = total_tok
+    scores["files"] = total_files
+    return scores
+
+
+def save_fitness(project_dir: str, scores: dict):
+    """Append fitness score to history file."""
+    fh = Path(project_dir) / FITNESS_HISTORY
+    fh.parent.mkdir(parents=True, exist_ok=True)
+    import yaml  # Try yaml, fallback to json
+    try:
+        data = yaml.safe_load(fh.read_text()) if fh.exists() else []
+    except:
+        data = []
+    entry = {"time": time.time(), "total": scores["total"]}
+    for k in FITNESS_WEIGHTS:
+        entry[k] = scores.get(k, 0)
+    entry["tokens"] = scores.get("tokens", 0)
+    entry["files"] = scores.get("files", 0)
+    data.append(entry)
+    data = data[-100:]  # Keep last 100
+    fh.write_text(yaml.dump(data, default_flow_style=False) if "yaml" in dir() else json.dumps(data, indent=2))
+
+
+# ═══════════════════════════════════════════════════
+# PROMPT LIBRARY — A/B тестування промптів
+# ═══════════════════════════════════════════════════
+
+PROMPT_LIBRARY_FILE = ".skva/prompt_library.yaml"
+
+# Default prompt variants per node type
+PROMPT_VARIANTS = {
+    NodeType.IMPLEMENT: {
+        "A": "Ти — Developer. Пиши код.\n{task}\n\nФормат: ``` // filepath: ... ```",
+        "B": "Ти — Developer. Сперва сплануй структуру, потім напиши код.\n{task}\n\nПлан:\n1. ...\n2. ...\n\nФормат: ``` // filepath: ... ```",
+        "C": "Ти — Senior Developer. Напиши production-ready код з обробкою помилок.\n{task}\n\nФормат: ``` // filepath: ... ```",
+    },
+    NodeType.REVIEW: {
+        "A": "Проведи code review. Знайди мінімум 3 проблеми:\n{task}",
+        "B": "Ти — QA Engineer. Перевір: безпеку, продуктивність, читабельність.\n{task}",
+    },
+}
+
+
+def get_prompt_variant(node_type: NodeType, variant: str = "") -> str:
+    """Get prompt template for a node type with optional variant override."""
+    variants = PROMPT_VARIANTS.get(node_type, {})
+    if not variants:
+        return ""
+    if variant and variant in variants:
+        return variants[variant]
+    # Auto-select best variant based on history
+    return variants.get("A", list(variants.values())[0])
+
+
+def save_prompt_score(project_dir: str, node_type: str, variant: str, fitness_total: float):
+    """Record a prompt variant's fitness score for future selection."""
+    pl = Path(project_dir) / PROMPT_LIBRARY_FILE
+    pl.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(pl.read_text()) if pl.exists() else {}
+    except:
+        data = {}
+    key = f"{node_type}:{variant}"
+    if key not in data:
+        data[key] = {"scores": [], "avg": 0.0, "count": 0}
+    data[key]["scores"].append(fitness_total)
+    data[key]["scores"] = data[key]["scores"][-20:]
+    data[key]["count"] = len(data[key]["scores"])
+    data[key]["avg"] = sum(data[key]["scores"]) / data[key]["count"]
+    pl.write_text(json.dumps(data, indent=2))
+
+
+def best_prompt_variant(project_dir: str, node_type: NodeType) -> str:
+    """Select the best-performing prompt variant based on history."""
+    pl = Path(project_dir) / PROMPT_LIBRARY_FILE
+    if not pl.exists():
+        return "A"
+    try:
+        data = json.loads(pl.read_text())
+    except:
+        return "A"
+    best_var, best_score = "A", 0.0
+    for key, info in data.items():
+        k_type, k_var = key.split(":", 1)
+        if k_type == node_type.value and info.get("count", 0) >= 2 and info["avg"] > best_score:
+            best_var, best_score = k_var, info["avg"]
+    return best_var
+
+
 async def import_skill(url: str, project_dir: str) -> bool:
     proc = await asyncio.create_subprocess_exec("curl", "-sL", url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
@@ -1565,6 +1704,12 @@ async def run_dag(workflow_nodes: List[Node], edges: List[tuple],
         ok = await run_node(sm.nodes[start_node], sm, request, project_dir, resources)
         report.end_phase(start_node, "success" if ok else "failure")
         report.print_final_summary()
+
+    # Fitness Function: оцінка якості запуску
+    scores = calculate_fitness(report)
+    log(f"📊 Fitness: {scores['total']:.3f} (tok_eff={scores['token_efficiency']:.2f}, "
+        f"quality={scores['file_quality']:.2f}, retry={scores['retry_count']:.2f})")
+    save_fitness(project_dir, scores)
 
     # Retro: самонавчання після DAG (10% бюджету)
     retro_rec = await run_retro(report, project_dir)
