@@ -36,10 +36,8 @@ def cmd_solo(request, project_dir="."):
         return False
 
 def cmd_rada_fabryka(request, project_dir="."):
-    """Rada+Fabryka — Рада → Фабрика → Деплой."""
+    """Rada+Fabryka — Рада (паралельно) → Фабрика → Деплой."""
     project_dir = os.path.abspath(project_dir)
-    
-    # Створити структуру
     for d in [".hermes/signals/heartbeat", ".hermes/artifacts/council",
               ".hermes/artifacts/factory/src", ".hermes/artifacts/factory/tests",
               ".hermes/artifacts/deploy"]:
@@ -47,35 +45,19 @@ def cmd_rada_fabryka(request, project_dir="."):
     
     start = time.time()
     log("🏗 Rada+Fabryka старт")
-
-    # Фаза 0: Ідеація
-    log("Фаза 0: Ідеація — аналіз запиту")
     
-    # Фаза 1: Council
-    log("Фаза 1: Council — Рада")
-    spawn_agent("architect", f"Write architecture spec for: {request}", project_dir)
-    spawn_agent("analyst", f"Write requirements spec for: {request}", project_dir)
-    
-    if not check_gate("council", project_dir, timeout=600):
+    # Фаза 1: Council — Architect + Analyst в ПАРАЛЕЛЬ
+    log("Фаза 1: Council (паралельно)")
+    from skva_core import council as council_phase
+    council_ok = council_phase(request, project_dir)
+    if not council_ok:
         log("❌ Council failed", "ERROR")
         return False
-    verify_phase("council", project_dir)
     
     # Фаза 2: Factory
-    log("Фаза 2: Factory — код")
-    spawn_agent("developer", f"Implement per spec in artifacts/council: {request}", project_dir, timeout=1800)
-    
-    if not check_gate("factory", project_dir, timeout=1800):
-        log("❌ Factory failed", "ERROR")
-        return False
-    verify_phase("factory", project_dir)
-    
-    # Фаза 3: Deploy
-    log("Фаза 3: Deploy")
-    spawn_agent("devops", f"Build and deploy the project in {project_dir}", project_dir, timeout=300)
-    
-    if not check_gate("deploy", project_dir, timeout=300):
-        log("⚠️ Deploy timeout — проект локально готовий")
+    log("Фаза 2: Factory")
+    from skva_core import factory as factory_phase
+    factory_ok = factory_phase(request, project_dir)
     
     elapsed = time.time() - start
     log(f"✅ Rada+Fabryka завершено за {elapsed:.0f}с")
