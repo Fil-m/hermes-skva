@@ -2006,10 +2006,20 @@ async def auto_fix(role, task_prompt, project_dir, max_retries=3,
 # ═══════════════════════════════════════════════════
 
 async def run_node(node: Node, sm: StateMachine, request: str, 
-                   project_dir: str, resources: ResourceManager) -> bool:
+                   project_dir: str, resources: ResourceManager,
+                   checkpoint_system=None, git_sync=None) -> bool:
     """Execute a single DAG node and transition."""
     log(f"🏗 DAG node: {node.id} ({node.type.value})")
     report = get_report()
+    
+    # Git pull + checkpoint before execution
+    if git_sync:
+        await git_sync.pull(project_dir)
+    if checkpoint_system:
+        await checkpoint_system.save_checkpoint(
+            phase=f"pre_{node.id}",
+            data={"node_id": node.id, "type": node.type.value}
+        )
     
     task = node.task_template.format(request=request) if node.task_template else request
     context = load_phase_context(project_dir, node.id)
@@ -2099,6 +2109,22 @@ async def run_node(node: Node, sm: StateMachine, request: str,
         await agents[0].run()
 
     success = any(a.success for a in agents) if agents else True
+    
+    # Git push + checkpoint after execution
+    if git_sync and success:
+        await git_sync.push(project_dir, f"Phase {node.id} complete")
+    if checkpoint_system:
+        if success:
+            await checkpoint_system.save_checkpoint(
+                phase=f"post_{node.id}",
+                data={"node_id": node.id, "status": "success"}
+            )
+        else:
+            await checkpoint_system.save_checkpoint(
+                phase=f"fail_{node.id}",
+                data={"node_id": node.id, "status": "failure"}
+            )
+    
     # REVIEW node: parse QA verdict, don't trust agent.success alone
     if node.type == NodeType.REVIEW and success:
         review_raw = agents[0].raw_output.upper()
@@ -2161,6 +2187,22 @@ async def run_dag(workflow_nodes: List[Node], edges: List[tuple],
     resources = ResourceManager(project_dir)
     start = time.time()
 
+    # Init checkpoint + git systems
+    checkpoint_system = None
+    git_sync = None
+    try:
+        from skva_impl.checkpoint_system import CheckpointSystem
+        checkpoint_system = CheckpointSystem(Path(project_dir))
+        log("CheckpointSystem initialized")
+    except ImportError:
+        pass
+    try:
+        from skva_impl.git_sync import GitSync
+        git_sync = GitSync(project_dir)
+        log("GitSync initialized")
+    except ImportError:
+        pass
+
     start_node = workflow_nodes[0].id if workflow_nodes else None
     if not start_node:
         log("❌ No start node in workflow", "ERROR")
@@ -2169,7 +2211,8 @@ async def run_dag(workflow_nodes: List[Node], edges: List[tuple],
     # Wrap execution in report context manager
     with RunReport(project_dir=project_dir) as report:
         report.start_phase(start_node, workflow_nodes[0].type.value)
-        ok = await run_node(sm.nodes[start_node], sm, request, project_dir, resources)
+        ok = await run_node(sm.nodes[start_node], sm, request, project_dir, resources,
+                             checkpoint_system=checkpoint_system, git_sync=git_sync)
         report.end_phase(start_node, "success" if ok else "failure")
         report.print_final_summary()
 
