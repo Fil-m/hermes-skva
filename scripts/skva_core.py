@@ -703,6 +703,115 @@ def _is_binary(path):
     return Path(path).suffix.lower() in BINARY_EXTENSIONS
 
 
+# ═══════════════════════════════════════════════════
+# GonkaClient — прямий API запит до Gonka
+# ═══════════════════════════════════════════════════
+
+GONKA_API = "https://proxy.gonka.gg/v1/chat/completions"
+GONKA_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+GONKA_PRICE_IN = 0.20   # $/M tokens input
+GONKA_PRICE_OUT = 0.30  # $/M tokens output
+
+def _load_gonka_key() -> str:
+    """Load Gonka API key from env or ~/.hermes/.env"""
+    key = os.environ.get("GONKA_API_KEY", "")
+    if key:
+        return key
+    env_path = os.path.expanduser("~/.hermes/.env")
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip().strip("export ")
+                if line.startswith("GONKA_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+def _gonka_estimate_cost(input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens * GONKA_PRICE_IN + output_tokens * GONKA_PRICE_OUT) / 1_000_000
+
+async def gonka_call(prompt: str, timeout: int = 300) -> tuple:
+    """
+    Call Gonka API directly. Returns (response_text, input_tokens, output_tokens).
+    Handles 429 with exponential backoff (1s, 2s, 4s, 8s).
+    Returns ("", 0, 0) on failure.
+    """
+    key = _load_gonka_key()
+    if not key:
+        log("GONKA_API_KEY not found", "ERROR")
+        return "", 0, 0
+
+    data = json.dumps({
+        "model": GONKA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 8192,
+        "temperature": 0.2,
+    })
+
+    for attempt in range(4):  # 0, 1, 2, 3 with 1,2,4,8s backoff
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "--max-time", str(timeout),
+                "-X", "POST", GONKA_API,
+                "-H", "Content-Type: application/json",
+                "-H", f"Authorization: Bearer {key}",
+                "-d", data,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout + 10
+            )
+        except asyncio.TimeoutError:
+            try: proc.kill()
+            except: pass
+            log(f"Gonka timeout (attempt {attempt+1}/4)", "WARN")
+            await asyncio.sleep(2 ** attempt)
+            continue
+
+        if proc.returncode != 0:
+            log(f"Gonka curl exit {proc.returncode} (attempt {attempt+1}/4)", "WARN")
+            await asyncio.sleep(2 ** attempt)
+            continue
+
+        try:
+            result = json.loads(stdout.decode())
+        except json.JSONDecodeError:
+            log(f"Gonka bad JSON (attempt {attempt+1}/4)", "WARN")
+            await asyncio.sleep(2 ** attempt)
+            continue
+
+        if "error" in result:
+            err = result["error"]
+            err_str = json.dumps(err)[:200]
+            if "429" in err_str:
+                wait = 2 ** attempt
+                log(f"Gonka 429 rate limit, waiting {wait}s...", "WARN")
+                await asyncio.sleep(wait)
+                continue
+            log(f"Gonka API error: {err_str}", "ERROR")
+            return "", 0, 0
+
+        if "choices" not in result:
+            log(f"Gonka unexpected response: {str(result)[:200]}", "ERROR")
+            return "", 0, 0
+
+        content = result["choices"][0]["message"]["content"]
+        usage = result.get("usage", {})
+        in_tok = usage.get("prompt_tokens", count_tokens(prompt))
+        out_tok = usage.get("completion_tokens", count_tokens(content))
+        cost = _gonka_estimate_cost(in_tok, out_tok)
+        log(f"Gonka OK: {in_tok}→{out_tok} tok, ~${cost:.6f}")
+        return content, in_tok, out_tok
+
+    log("Gonka all 4 attempts failed", "ERROR")
+    return "", 0, 0
+
+
+def is_gonka_model(model: str) -> bool:
+    """Check if model string refers to Gonka."""
+    return model and ("qwen" in model.lower() or "gonka" in model.lower())
+
+
 def load_phase_context(project_dir, phase, max_chars=12000):
     phase_dir = Path(project_dir) / ".hermes" / "artifacts" / phase
     if not phase_dir.exists():
@@ -848,33 +957,47 @@ class MarkdownAgent:
             env["HERMES_INFERENCE_MODEL"] = self.model
             log(f"  model: {self.model}")
 
-        proc = await asyncio.create_subprocess_exec(
-            "hermes", "chat", "-q", self.full_prompt,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            preexec_fn=limit_resources if sys.platform != "win32" else None,
-            env=env
-        )
+        use_gonka = is_gonka_model(self.model)
 
-        output_lines = []
-        try:
-            while True:
-                try:
-                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=self.timeout)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    self.error = "timeout"
-                    self.error_code = ErrorCode.TIMEOUT
-                    break
-                if not line:
-                    break
-                output_lines.append(line.decode(errors='replace'))
-            self.raw_output = "".join(output_lines)
-            await proc.stderr.read()
-        except Exception as e:
-            proc.kill()
-            self.error = str(e)
-            self.raw_output = "".join(output_lines)
+        if use_gonka:
+            # Call Gonka API directly (cheaper, faster for complex tasks)
+            log(f"  → Gonka {GONKA_MODEL}")
+            response, in_tok, out_tok = await gonka_call(
+                self.full_prompt, timeout=self.timeout
+            )
+            self.raw_output = response
+            self.input_tokens = in_tok
+            self.output_tokens = out_tok
+            log(f"  Gonka done: {len(response)} chars, {in_tok}→{out_tok} tok")
+        else:
+            # Call Hermes CLI (default model)
+            proc = await asyncio.create_subprocess_exec(
+                "hermes", "chat", "-q", self.full_prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=limit_resources if sys.platform != "win32" else None,
+                env=env
+            )
+
+            output_lines = []
+            try:
+                while True:
+                    try:
+                        line = await asyncio.wait_for(proc.stdout.readline(), timeout=self.timeout)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        self.error = "timeout"
+                        self.error_code = ErrorCode.TIMEOUT
+                        break
+                    if not line:
+                        break
+                    output_lines.append(line.decode(errors='replace'))
+                self.raw_output = "".join(output_lines)
+                await proc.stderr.read()
+            except Exception as e:
+                proc.kill()
+                self.error = str(e)
+                self.raw_output = "".join(output_lines)
 
         elapsed = time.time() - start
         self.run_duration = elapsed
@@ -1206,6 +1329,7 @@ def build_solo_dag() -> List[Node]:
         Node("impl", NodeType.IMPLEMENT, "fullstack",
              system_prompt="Ти — Fullstack Developer.",
              task_template="{request}",
+             model="qwen3-235b",
              on_success=["done"]),
         Node("done", NodeType.DONE, "", on_success=[]),
     ]
@@ -1246,6 +1370,7 @@ def build_agile_dag() -> List[Node]:
              on_failure=["error"]),
         Node("implement", NodeType.IMPLEMENT, "developer",
              task_template="{request}",
+             model="qwen3-235b",
              on_success=["review"],
              on_failure=["fix"]),
         Node("review", NodeType.REVIEW, "qa",
@@ -1254,6 +1379,7 @@ def build_agile_dag() -> List[Node]:
              on_failure=["fix"]),
         Node("fix", NodeType.FIX, "developer",
              task_template="ВИПРАВ ПОМИЛКИ:\n{request}",
+             model="qwen3-235b",
              on_success=["review"],
              on_failure=["error"]),
         Node("done", NodeType.DONE, ""),
@@ -1272,12 +1398,14 @@ def build_pipeline_dag() -> List[Node]:
              on_success=["implement"], on_failure=["error"]),
         Node("implement", NodeType.IMPLEMENT, "developer",
              task_template="{request}",
+             model="qwen3-235b",
              on_success=["review"], on_failure=["fix"]),
         Node("review", NodeType.REVIEW, "qa",
              task_template="{request}",
              on_success=["deploy"], on_failure=["fix"]),
         Node("fix", NodeType.FIX, "developer",
              task_template="ВИПРАВ ПОМИЛКИ:\n{request}",
+             model="qwen3-235b",
              on_success=["review"], on_failure=["error"]),
         Node("deploy", NodeType.DEPLOY, "fullstack",
              task_template="{request}",
