@@ -19,49 +19,16 @@ from skva_core import (
 )
 
 def cmd_solo(request, project_dir="."):
-    """Solo method — один агент, швидкий фікс."""
-    project_dir = os.path.abspath(project_dir)
-    os.makedirs(project_dir, exist_ok=True)
-    os.makedirs(f"{project_dir}/.hermes/signals/heartbeat", exist_ok=True)
-    os.makedirs(f"{project_dir}/.hermes/artifacts/fullstack", exist_ok=True)
-    
-    log("⚡ Solo: запуск")
-    result = solo(request, project_dir)
-    
-    if result:
-        log(f"✅ Solo виконано успішно")
-        return True
-    else:
-        log(f"❌ Solo: помилка виконання")
-        return False
+    """Solo method — async, JSON output, Python creates files."""
+    import asyncio
+    from skva_core import solo as solo_async
+    return asyncio.run(solo_async(request, project_dir))
 
 def cmd_rada_fabryka(request, project_dir="."):
-    """Rada+Fabryka — Рада (паралельно) → Фабрика → Деплой."""
-    project_dir = os.path.abspath(project_dir)
-    for d in [".hermes/signals/heartbeat", ".hermes/artifacts/council",
-              ".hermes/artifacts/factory/src", ".hermes/artifacts/factory/tests",
-              ".hermes/artifacts/deploy"]:
-        os.makedirs(f"{project_dir}/{d}", exist_ok=True)
-    
-    start = time.time()
-    log("🏗 Rada+Fabryka старт")
-    
-    # Фаза 1: Council — Architect + Analyst в ПАРАЛЕЛЬ
-    log("Фаза 1: Council (паралельно)")
-    from skva_core import council as council_phase
-    council_ok = council_phase(request, project_dir)
-    if not council_ok:
-        log("❌ Council failed", "ERROR")
-        return False
-    
-    # Фаза 2: Factory
-    log("Фаза 2: Factory")
-    from skva_core import factory as factory_phase
-    factory_ok = factory_phase(request, project_dir)
-    
-    elapsed = time.time() - start
-    log(f"✅ Rada+Fabryka завершено за {elapsed:.0f}с")
-    return True
+    """Rada+Fabryka — async parallel + auto-fix loop."""
+    import asyncio
+    from skva_core import rada_fabryka
+    return asyncio.run(rada_fabryka(request, project_dir))
 
 def cmd_doctor():
     """Діагностика системи."""
