@@ -2620,6 +2620,77 @@ FACTORY_MODULES = {
 }
 
 
+# Multi-provider round-robin for ModularFactory
+PROVIDERS = [
+    {"name": "gonka", "url": "https://proxy.gonka.gg/v1/chat/completions",
+     "model": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8", "key_var": "GONKA_API_KEY",
+     "cost_in": 0.20, "cost_out": 0.30, "timeout": 120},
+    {"name": "deepseek", "url": "https://api.deepseek.com/v1/chat/completions",
+     "model": "deepseek-chat", "key_var": "DEEPSEEK_API_KEY",
+     "cost_in": 2.00, "cost_out": 8.00, "timeout": 60},
+]
+
+_provider_index = 0
+
+def _next_provider():
+    global _provider_index
+    p = PROVIDERS[_provider_index % len(PROVIDERS)]
+    _provider_index += 1
+    return p
+
+
+async def multi_provider_call(prompt, timeout=None):
+    """Call next provider in round-robin. Falls back on failure."""
+    p = _next_provider()
+    key = os.environ.get(p["key_var"], "")
+    if not key:
+        env = Path.home() / '.hermes' / '.env'
+        if env.exists():
+            for line in open(env):
+                line = line.strip()
+                if line.startswith('#') or '=' not in line:
+                    continue
+                if p["key_var"] in line:
+                    key = line.split('=', 1)[1].strip().strip('"').strip("'")
+                    break
+    if not key:
+        log(f"  Key not found: {p['key_var']}", "WARN")
+        return "", 0, 0
+    
+    t = timeout or p["timeout"]
+    data = json.dumps({"model": p["model"], "messages": [{"role": "user", "content": prompt}], "max_tokens": 8192, "temperature": 0.2})
+    import tempfile as _tf
+    data_dir = _tf.mkdtemp(prefix="skva_prov_")
+    data_file = Path(data_dir) / "data.json"
+    data_file.write_text(data)
+    
+    log(f"  → {p['name']}: {p['model']} ({t}s)")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "--max-time", str(t), "-X", "POST", p["url"],
+            "-H", "Content-Type: application/json",
+            "-H", f"Authorization: Bearer {key}",
+            "-d", f"@{data_file}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=t + 10)
+        shutil.rmtree(data_dir, ignore_errors=True)
+        if proc.returncode != 0:
+            log(f"  {p['name']} curl exit {proc.returncode}", "WARN")
+            return "", 0, 0
+        d = json.loads(stdout)
+        usage = d.get("usage", {})
+        it = usage.get("prompt_tokens", 0)
+        ot = usage.get("completion_tokens", 0)
+        content = d["choices"][0]["message"]["content"]
+        cost = (it * p["cost_in"] + ot * p["cost_out"]) / 1_000_000
+        log(f"  {p['name']} OK: {it}→{ot} tok, ~${cost:.6f}")
+        return content, it, ot
+    except Exception as e:
+        shutil.rmtree(data_dir, ignore_errors=True)
+        log(f"  {p['name']} failed: {str(e)[:60]}", "WARN")
+        return "", 0, 0
+
+
 async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
     import time as _t
     project_dir = os.path.abspath(project_dir)
@@ -2647,7 +2718,7 @@ async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
         try:
             results = await asyncio.wait_for(
                 asyncio.gather(*[chunker.summarize_chunk(c, i+j, len(chunks)) for j, c in enumerate(batch)]),
-                timeout=60
+                timeout=120
             )
             summaries.extend(results)
         except asyncio.TimeoutError:
@@ -2703,7 +2774,7 @@ async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
                 # C) Timeout: 180s → 90s
                 p = f"Implement '{mod['name']}'. Complete HTML+CSS+JS inline. Dark theme, mobile, self-contained. CONTEXT: {ctx[:5000]} SPEC: {snip[:2500]}"
                 try:
-                    r, it, ot = await asyncio.wait_for(gonka_call(p, timeout=180), timeout=190)
+                    r, it, ot = await asyncio.wait_for(multi_provider_call(p), timeout=190)
                 except (asyncio.TimeoutError, Exception) as e:
                     log(f"  {mod['name']} attempt {retry+1} failed: {str(e)[:60]}", "WARN")
                     if retry == 0:
@@ -2765,7 +2836,7 @@ async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
     # 6. Integration: create index.html with fallback
     ip = f"Create index.html for Habitat OS. Integrate: {list(all_files.keys())}. Dark hub with tab navigation, header bar."
     try:
-        ir, _, _ = await asyncio.wait_for(gonka_call(ip, timeout=90), timeout=100)
+        ir, _, _ = await asyncio.wait_for(multi_provider_call(ip), timeout=100)
         for m in re.finditer(r"```html\n(.*?)```", ir or "", re.DOTALL):
             all_files["index.html"] = m.group(1)
             break
