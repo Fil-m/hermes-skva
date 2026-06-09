@@ -1,0 +1,83 @@
+- id: RISK-001
+  description: Large Language Model (LLM) fails to respond or times out during critical operation
+  probability: medium
+  impact: high
+  mitigation: Implement retry logic with fallback models and circuit breaker pattern
+  status: active
+
+- id: RISK-002
+  description: SSH connection to remote server is lost during agent execution
+  probability: medium
+  impact: medium
+  mitigation: Use persistent sessions with auto-reconnect; monitor connection health
+  status: active
+
+- id: RISK-003
+  description: Git merge conflict occurs during collaborative development or auto-commit
+  probability: high
+  impact: medium
+  mitigation: Enforce branch protection rules; use automated conflict detection and manual review gates
+  status: active
+
+- id: RISK-004
+  description: Project budget exceeded due to uncontrolled API or resource usage
+  probability: medium
+  impact: high
+  mitigation: Implement real-time cost monitoring with alerts and hard spending caps
+  status: active
+
+- id: RISK-005
+  description: Agent behavior drifts from intended purpose due to iterative self-modification
+  probability: low
+  impact: high
+  mitigation: Enforce strict policy checks and periodic human-in-the-loop validation
+  status: active
+
+- id: RISK-006
+  description: Code or output fails quality gate (e.g., linting, testing, security scan)
+  probability: high
+  impact: medium
+  mitigation: Integrate automated quality gates in CI/CD pipeline with blocking enforcement
+  status: active
+
+- id: RISK-007
+  description: Local or remote file system becomes full, preventing write operations
+  probability: medium
+  impact: high
+  mitigation: Monitor disk usage; implement auto-cleanup of temporary files and alerts at thresholds
+  status: active
+
+- id: RISK-008
+  description: User manually interrupts agent workflow during execution
+  probability: medium
+  impact: low
+  mitigation: Support graceful shutdown and checkpoint resumption; log interruption events
+  status: active
+
+- id: RISK-009
+  description: Required AI model is temporarily or permanently unavailable
+  probability: medium
+  impact: high
+  mitigation: Maintain local model cache or fallback models; monitor model endpoint health
+  status: active
+
+- id: RISK-010
+  description: Skill definition fails to parse due to syntax or schema error
+  probability: low
+  impact: medium
+  mitigation: Validate skill syntax at commit time; provide schema-aware editors and linting
+  status: active
+
+- id: RISK-011
+  description: Directed Acyclic Graph (DAG) of tasks enters deadlock due to circular dependency
+  probability: low
+  impact: high
+  mitigation: Validate DAG structure before execution; include cycle detection algorithms
+  status: active
+
+- id: RISK-012
+  description: Retro agent responsible for self-improvement fails to generate valid updates
+  probability: medium
+  impact: medium
+  mitigation: Run retro agent in sandboxed environment with rollback capability and validation
+  status: active
