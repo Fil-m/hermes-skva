@@ -1,0 +1,43 @@
+models:
+  qwen3-235b:
+    provider: gonka
+    cost_per_million_input: 0.20
+    cost_per_million_output: 0.30
+    recommended_for: [implement, fix]
+    max_tokens: 32000
+  deepseek-v4:
+    provider: hermes
+    cost_per_million_input: 2.00
+    cost_per_million_output: 8.00
+    recommended_for: [analyze, design, review]
+    max_tokens: 16000
+  llama-3-70b:
+    provider: skva
+    cost_per_million_input: 1.50
+    cost_per_million_output: 4.00
+    recommended_for: [design, analyze, review]
+    max_tokens: 8192
+  mistral-large:
+    provider: mistral
+    cost_per_million_input: 2.50
+    cost_per_million_output: 7.50
+    recommended_for: [analyze, review]
+    max_tokens: 32768
+  claude-3-opus:
+    provider: anthropic
+    cost_per_million_input: 15.00
+    cost_per_million_output: 75.00
+    recommended_for: [design, analyze, review]
+    max_tokens: 200000
+  gpt-4o:
+    provider: openai
+    cost_per_million_input: 5.00
+    cost_per_million_output: 15.00
+    recommended_for: [design, implement, review, analyze]
+    max_tokens: 128000
+  gemini-pro:
+    provider: google
+    cost_per_million_input: 3.50
+    cost_per_million_output: 10.50
+    recommended_for: [analyze, implement, review]
+    max_tokens: 32768

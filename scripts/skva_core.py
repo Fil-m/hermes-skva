@@ -1854,6 +1854,20 @@ Output: concise summary in Ukrainian, max 500 chars. Focus on actionable require
         return merged
 
 
+# --- SKVA status constants ---
+NODE_STATUS = ["pending", "running", "success", "failed", "skipped"]
+
+
+async def spawn_agent(role, task, project_dir, model="", skills=None):
+    """Spawn an agent. Alias for MarkdownAgent.run(). Aligns TZ spawn_agent()."""
+    agent = MarkdownAgent(role=role, task_prompt=task, project_dir=project_dir,
+                          model=model)
+    if skills:
+        log(f"  Skills for {role}: {skills}")
+    await agent.run()
+    return agent
+
+
 class MarkdownAgent:
     """
     Agent that uses markdown code blocks with // filepath:.
