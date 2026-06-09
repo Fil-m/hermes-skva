@@ -34,6 +34,9 @@ except: pass
 try:
     from skva_impl.agent_registry import AgentRegistry
 except: pass
+try:
+    from skva_impl.feedback_loop import FeedbackLoop
+except: pass
 
 
 # ═══════════════════════════════════════════════════

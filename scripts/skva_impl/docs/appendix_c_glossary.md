@@ -1,0 +1,30 @@
+| Term | Definition | Related |
+|---|---|---|
+| SKVA | Self-Knowledge Validation Architecture — a framework for autonomous, self-improving AI agent systems that use structured workflows, feedback loops, and modular skills to execute and optimize complex tasks. | Orchestrator, Agent, Skill, FeedbackLoop, AutoMode |
+| Orchestrator | The central controller in SKVA responsible for managing agent workflows, coordinating skill execution, enforcing phases, and maintaining system state. It interprets DAGs and routes tasks to appropriate agents. | Agent, DAG, Phase, SkillRouter, RunReport |
+| Agent | An autonomous entity within SKVA that performs specific tasks using skills. Agents can be specialized by role and may include self-improvement capabilities. | Skill, Role, RetroAgent, SelfImprover, AgentRegistry |
+| Skill | A reusable unit of functionality within SKVA that encapsulates a specific action or capability (e.g., code generation, validation). Skills are invoked by agents and can be composed into methods. | Method, Agent, Prompt Library, ModularFactory |
+| Method | A defined sequence of skills and logic used by an agent to accomplish a particular objective. Methods are modular and can be dynamically selected or improved. | Skill, Phase, Agent, SkillRouter |
+| Phase | A stage in a SKVA workflow representing a logical segment of execution (e.g., planning, execution, validation). Phases help structure the DAG and enforce process flow. | DAG, Orchestrator, Gate, Checkpoint |
+| Role | A behavioral and functional designation assigned to an agent, determining its permissions, available skills, and responsibilities within the system. | Agent, AgentRegistry, SkillRouter |
+| DAG | Directed Acyclic Graph — a data structure used in SKVA to represent the workflow of tasks, where nodes are operations and edges define execution order without cycles. | Node, Phase, Orchestrator, Gate |
+| Node | A single task or operation within a DAG, representing the execution of a skill, method, or decision point. | DAG, Skill, Gate, Checkpoint |
+| Gate | A decision point in a DAG that evaluates conditions (e.g., success, quality) before allowing workflow progression. Gates enforce control flow and validation. | DAG, Node, Quality Gate, Checkpoint |
+| Checkpoint | A saved state or intermediate result in a SKVA workflow, used for recovery, auditing, or feedback. Checkpoints are created at key nodes or phases. | Node, Phase, RunReport, RetroAgent |
+| Error Code | A standardized identifier used in SKVA to classify execution failures, enabling consistent error handling, debugging, and self-improvement responses. | Agent, FeedbackLoop, SelfImprover, RunReport |
+| Quality Gate | A type of gate that evaluates output quality against defined metrics or fitness functions before allowing workflow continuation. Ensures output standards are met. | Gate, Fitness Function, DAG, Checkpoint |
+| Fitness Function | A metric or set of criteria used to evaluate the effectiveness, accuracy, or quality of an agent’s output or behavior, often used in self-improvement loops. | Quality Gate, SelfImprover, FeedbackLoop, RetroAgent |
+| RetroAgent | A specialized agent in SKVA responsible for analyzing past executions, checkpoints, and run reports to generate insights for system improvement. | FeedbackLoop, RunReport, SelfImprover, Checkpoint |
+| SelfImprover | A component or agent module that uses feedback, error analysis, and fitness evaluation to iteratively refine skills, methods, or workflows. | RetroAgent, FeedbackLoop, Fitness Function, Skill |
+| SkillRouter | A SKVA component that dynamically selects and assigns the most appropriate skill or method to an agent based on context, role, and performance history. | Skill, Agent, Role, ModularFactory |
+| ModularFactory | A design pattern and system component in SKVA that enables on-demand creation and assembly of skills, methods, or agents using configurable templates. | Skill, Method, SkillRouter, Prompt Library |
+| Gonka | A lightweight scripting or configuration language used in SKVA to define skills, methods, and DAG logic in a human-readable, version-controllable format. | Skill, DAG, Prompt Library, ModularFactory |
+| Prompt Library | A centralized repository of reusable prompts, templates, and instructions used by agents and skills, especially in LLM-based operations. | Skill, Gonka, ModularFactory, Agent |
+| Budget | A constraint in SKVA defining limits on resources such as API calls, execution time, tokens, or cost, used to guide agent behavior and prevent overuse. | Agent, AutoMode, Orchestrator, RunReport |
+| AgentRegistry | A system-managed catalog of available agents, their roles, capabilities, and statuses, used by the Orchestrator and SkillRouter for task assignment. | Agent, Role, Orchestrator, SkillRouter |
+| SSHSpawn | A mechanism in SKVA for remotely launching and managing agent processes on external systems via SSH, enabling distributed execution. | Agent, Orchestrator, Heartbeat, RunReport |
+| Heartbeat | A periodic signal sent by agents to the Orchestrator to indicate active status, health, and readiness. Used for monitoring and failure detection. | Agent, Orchestrator, SSHSpawn, RunReport |
+| RunReport | A detailed log and summary of a SKVA execution cycle, including checkpoints, errors, metrics, and outcomes. Used for auditing and feedback. | Checkpoint, Error Code, RetroAgent, Dashboard |
+| Dashboard | A visual interface in SKVA that displays system status, run reports, agent health, budgets, and performance metrics for monitoring and control. | RunReport, Heartbeat, Budget, Orchestrator |
+| AutoMode | A SKVA operational mode where workflows execute with minimal human intervention, using feedback loops, gates, and self-improvement to adapt autonomously. | FeedbackLoop, Orchestrator, SelfImprover, Quality Gate |
+| FeedbackLoop | A core SKVA mechanism where outputs, errors, and performance data are analyzed and used to refine agents, skills, and workflows iteratively. | RetroAgent, SelfImprover, Fitness Function, RunReport |
