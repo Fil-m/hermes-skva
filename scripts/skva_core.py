@@ -2707,8 +2707,11 @@ async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
                 except (asyncio.TimeoutError, Exception) as e:
                     log(f"  {mod['name']} attempt {retry+1} failed: {str(e)[:60]}", "WARN")
                     if retry == 0:
-                        # Reduce spec before retry to avoid another timeout
-                        snip = snip[:800]
+                        # Reduce spec before retry
+                        snip = snip[:500]
+                    else:
+                        # Last resort: minimal spec
+                        snip = str(mod.get("features", ""))[:300]
                     continue
                 
                 # B) Two-pass parser: filepath blocks → ```html blocks → full response
