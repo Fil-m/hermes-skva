@@ -1,55 +1,45 @@
-# SKVA FeaturePatcher
+"""SKVA FeaturePatcher — generate focused code patches for missing features."""
 import re
-from skva_core import multi_provider_call, log, parse_search_replace_blocks, apply_search_replace
+from skva_core import multi_provider_call, log
 
-# ═══════════════════════════════════════════════════
-# FEATURE PATCHER — Generate & apply targeted code patches
-# ═══════════════════════════════════════════════════
-
-from typing import Dict, Any
-import asyncio
-
-# Assume these are available from core
-from skva_core import (
-    multi_provider_call,
-    log,
-    parse_search_replace_blocks,
-    apply_search_replace
-)
-
-
-@dataclass
 class FeaturePatcher:
-    """
-    FeaturePatcher generates precise code modifications to implement
-    a single missing feature using LLM-guided SEARCH/REPLACE patches.
-    Operates purely in memory, fully async, no direct file I/O.
-    """
+    """Generate a focused code patch for ONE missing feature."""
 
-    model: str = "gpt-4o"
-    provider: str = "openai"
-    timeout: float = 30.0
-    max_retries: int = 2
+    async def patch(self, tz_section: str, code: str, feature: dict) -> str:
+        prompt = f"""Add this missing feature to the code.
 
-    async def patch(self, tz_section: str, code: str, feature: Dict[str, Any]) -> str:
-        """
-        Generate a SEARCH/REPLACE patch to implement the given feature.
-        Uses the TZ (Task Zone) context to guide implementation.
+FEATURE: {feature.get('feature', 'unknown')}
+SEVERITY: {feature.get('severity', 'medium')}
+TZ SAYS: {feature.get('tz_quote', '')}
+FIX SUGGESTION: {feature.get('fix', '')}
 
-        Args:
-            tz_section: Contextual guidance from task planner
-            code: Current version of the code (full string)
-            feature: Dict describing the feature (name, description, params, etc.)
+EXISTING CODE:
+{code[:3000]}
 
-        Returns:
-            Patched code string with the feature applied
-        """
-        prompt = (
-            f"Add this feature: {json.dumps(feature, indent=2)}\n\n"
-            f"Implementation guidance (TZ section):\n{tz_section}\n\n"
-            f"Existing code (truncated if long):\n{code[:MAX_FILE_CHARS]}\n\n"
-            f"Generate ONLY the minimal SEARCH/REPLACE block needed to implement this feature.\n"
-            f"Do NOT include explanations, comments, or extra code.\n"
-            f"Ensure imports, function definitions, and indentation are correct.\n"
-            f"Return format:\n"
-            f"
+Generate ONLY the code changes. Use SEARCH/REPLACE format:
+<<<<<<< SEARCH
+[exact existing code]
+=======
+[new code with feature added]
+>>>>>>> REPLACE"""
+        text, it, ot = await multi_provider_call(prompt, timeout=120)
+        return text or ""
+
+    def apply_patch(self, code: str, patch_text: str) -> str:
+        """Apply SEARCH/REPLACE patch to code."""
+        blocks = re.findall(
+            r'<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE',
+            patch_text, re.DOTALL
+        )
+        result = code
+        for old, new in blocks:
+            if old.strip() in result:
+                result = result.replace(old.strip(), new.strip())
+            else:
+                log(f"  Patch target not found, appending", "WARN")
+                result += f"\n\n# ADDED: {new[:100]}...\n{new}"
+        return result
+
+    def estimate_complexity(self, feature: dict) -> int:
+        sev = feature.get('severity', 'medium')
+        return {"high": 5, "medium": 3, "low": 1}.get(sev, 2)

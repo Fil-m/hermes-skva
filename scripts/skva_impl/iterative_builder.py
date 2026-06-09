@@ -65,10 +65,7 @@ class IterativeBuilder:
         base_prompt = self._construct_base_prompt(tz_section)
         try:
             response = await self._multi_provider_call(base_prompt)
-            current_code = response.get("content", "").strip()
-            if report:
-                run_rec.input_tokens += response.get("input_tokens", 0)
-                run_rec.output_tokens += response.get("output_tokens", 0)
+            current_code = (response or "").strip()
         except Exception as e:
             if report:
                 run_rec.status = "failed"
@@ -239,20 +236,6 @@ Ensure all required functionality is included.
 Use clear, maintainable code with type hints where appropriate.
         """.strip()
 
-    async def _multi_provider_call(self, prompt: str) -> Dict[str, Any]:
-        """
-        Placeholder for actual multi-provider LLM call.
-        In real implementation, this would route to smart_model or fallbacks.
-        """
-        # Simulate async LLM call
-        await asyncio.sleep(0.1)
-
-        # This should be replaced with actual provider logic (e.g., from skva_impl.providers)
-        # For now, return mock response
-        return {
-            "content": f'# Generated code for "{prompt.split()[0]}"\n\ndef placeholder():\n    """Auto-generated module."""\n    pass\n',
-            "input_tokens": 150,
-            "output_tokens": 75,
-            "model": self.model,
-            "provider": self.provider,
-        }
+    async def _multi_provider_call(self, prompt: str) -> str:
+        text, it, ot = await multi_provider_call(prompt, timeout=120)
+        return text or ""

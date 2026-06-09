@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Optional
 import json
 import re
 from dataclasses import dataclass
-from skva_impl.utils import multi_provider_call  # Assuming available in skva_impl
+from skva_core import multi_provider_call, log
 
 
 @dataclass
@@ -52,22 +52,19 @@ If no requirements found, return [].
             return []
 
         try:
-            # Call LLM with system prompt and TZ text
-            response = await multi_provider_call(
-                system_prompt=self._SYSTEM_PROMPT,
-                user_prompt=tz_text.strip(),
-                response_format={"type": "json_object"},  # Expecting array inside
-                temperature=0.1,
-            )
-
+            # Call LLM with TZ text
+            response_text, it, ot = await multi_provider_call(tz_text.strip()[:5000] + "\n\n" + self._SYSTEM_PROMPT)
+            if not response_text:
+                log("  LLM returned empty response, using fallback", "WARN")
+                return []
+            
             # Attempt to extract JSON from response
-            content = response.get("content", "")
-            json_match = re.search(r'\[.*\]', content, re.DOTALL)
+            json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
             if json_match:
                 req_list = json.loads(json_match.group())
             else:
                 # Fallback: try parsing whole response
-                req_list = json.loads(content)
+                req_list = json.loads(response_text)
 
             # Validate and sanitize each requirement
             result = []

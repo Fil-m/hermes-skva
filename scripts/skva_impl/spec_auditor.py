@@ -1,63 +1,41 @@
-# SKVA SpecAuditor
-import json
+"""SKVA SpecAuditor — compare code against TZ section."""
+import json, re
 from skva_core import multi_provider_call, log
 
-# ═══════════════════════════════════════════════════
-# SPEC AUDITOR — Validate generated code against TZ spec
-# ═══════════════════════════════════════════════════
-
-from typing import List, Dict, Any
-from skva_core import multi_provider_call, log
-
-
-@dataclass
 class SpecAuditor:
-    """
-    Compares generated code against the TZ (Technical Zone) specification section
-    to identify missing or incomplete features using LLM-based semantic analysis.
-    
-    Pure async — no file I/O. Operates solely on string inputs and returns structured results.
-    """
+    """Compare generated code against TZ section, return list of missing features."""
 
-    async def audit(self, tz_section: str, code: str) -> List[Dict[str, Any]]:
-        """
-        Analyze whether the provided code implements all features described in the TZ section.
-        
-        Args:
-            tz_section: The technical specification text (TZ section)
-            code: The generated implementation code to validate
-            
-        Returns:
-            List of missing features with details:
-            [
-                {
-                    "feature": "pixel_lifetime",
-                    "severity": "high",  # high | medium | low
-                    "tz_quote": "Each pixel must carry a timestamp...",
-                    "fix": "Add timestamp field and update lifecycle handler..."
-                },
-                ...
-            ]
-        """
-        if not tz_section.strip():
-            log("SpecAuditor.audit: tz_section is empty", level="warning")
+    async def audit(self, tz_section: str, code: str) -> list:
+        prompt = f"""Compare this TZ section with the code below. List ALL features from TZ that are NOT implemented in code.
+
+TZ:
+{tz_section[:3000]}
+
+CODE:
+{code[:3000]}
+
+Return JSON list: [{{"feature":"...","severity":"high|med|low","tz_quote":"...","fix":"..."}}]
+JSON ONLY."""
+        text, it, ot = await multi_provider_call(prompt, timeout=120)
+        if not text:
             return []
+        m = re.search(r'\[.*\]', text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except:
+                pass
+        return []
 
-        if not code.strip():
-            log("SpecAuditor.audit: code is empty", level="warning")
-            return []
+    def format_report(self, missing: list) -> str:
+        if not missing:
+            return "✅ All requirements implemented"
+        lines = [f"⚠️ {len(missing)} missing features:"]
+        for m in missing:
+            lines.append(f"  [{m.get('severity','?')}] {m.get('feature','?')}: {m.get('fix','')[:80]}")
+        return "\n".join(lines)
 
-        prompt = f'''
-You are a senior software auditor. Your task is to compare the following technical specification (TZ section)
-with the provided implementation code and identify any missing or incomplete features.
-
-Only report features that are clearly described in the TZ but not implemented in the code.
-Do not report stylistic or performance issues unless explicitly required by the spec.
-
-For each missing feature, return:
-- feature: short identifier (snake_case)
-- severity: high (core functionality), medium (important), low (optional/nice-to-have)
-- tz_quote: verbatim short excerpt from TZ justifying the feature
-- fix: concise implementation suggestion
-
-TZ SPECIFICATION:
+    def severity(self, missing_count: int) -> str:
+        if missing_count == 0: return "done"
+        if missing_count < 3: return "improving"
+        return "many"
