@@ -2167,7 +2167,8 @@ async def auto_fix(role, task_prompt, project_dir, max_retries=3,
 
 async def run_node(node: Node, sm: StateMachine, request: str, 
                    project_dir: str, resources: ResourceManager,
-                   checkpoint_system=None, git_sync=None) -> bool:
+                   checkpoint_system=None, git_sync=None,
+                   budget=None, gate_system=None) -> bool:
     """Execute a single DAG node and transition."""
     log(f"🏗 DAG node: {node.id} ({node.type.value})")
     report = get_report()
@@ -2180,6 +2181,11 @@ async def run_node(node: Node, sm: StateMachine, request: str,
             phase=f"pre_{node.id}",
             data={"node_id": node.id, "type": node.type.value}
         )
+    
+    # Gate: wait for phase gate before executing
+    if gate_system:
+        log(f"  Gate waiting: {gate_system.path.name}")
+        await gate_system.wait(timeout=300)
     
     task = node.task_template.format(request=request) if node.task_template else request
     context = load_phase_context(project_dir, node.id)
@@ -2270,9 +2276,22 @@ async def run_node(node: Node, sm: StateMachine, request: str,
 
     success = any(a.success for a in agents) if agents else True
     
+    # Budget tracking
+    if budget and agents:
+        total_tok = sum(getattr(a, 'input_tokens', 0) + getattr(a, 'output_tokens', 0) for a in agents if hasattr(a, 'input_tokens'))
+        total_cost = sum(getattr(a, 'estimated_cost', getattr(a, 'input_tokens', 0)*2/1_000_000) for a in agents if hasattr(a, 'input_tokens'))
+        if not budget.track(total_tok, total_cost):
+            log(f"Budget exceeded for {node.id}, aborting", "ERROR")
+            success = False
+    
     # Git push + checkpoint after execution
     if git_sync and success:
         await git_sync.push(project_dir, f"Phase {node.id} complete")
+    
+    # Gate: open for next phase on success
+    if gate_system and success:
+        gate_system.set()
+    
     if checkpoint_system:
         if success:
             await checkpoint_system.save_checkpoint(
