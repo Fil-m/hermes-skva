@@ -2695,7 +2695,7 @@ async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
                 elif in_section:
                     section_lines.append(line)
             if section_lines:
-                snip = "\n".join(section_lines)[:3000]
+                snip = "\n".join(section_lines)[:1500]
             if not snip:
                 snip = str(mod.get("features", ""))
             
@@ -2703,9 +2703,12 @@ async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
                 # C) Timeout: 180s → 90s
                 p = f"Implement '{mod['name']}'. Complete HTML+CSS+JS inline. Dark theme, mobile, self-contained. CONTEXT: {ctx[:5000]} SPEC: {snip[:2500]}"
                 try:
-                    r, it, ot = await asyncio.wait_for(gonka_call(p, timeout=90), timeout=100)
+                    r, it, ot = await asyncio.wait_for(gonka_call(p, timeout=180), timeout=190)
                 except (asyncio.TimeoutError, Exception) as e:
                     log(f"  {mod['name']} attempt {retry+1} failed: {str(e)[:60]}", "WARN")
+                    if retry == 0:
+                        # Reduce spec before retry to avoid another timeout
+                        snip = snip[:800]
                     continue
                 
                 # B) Two-pass parser: filepath blocks → ```html blocks → full response
