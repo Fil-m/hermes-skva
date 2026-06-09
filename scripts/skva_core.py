@@ -15,6 +15,26 @@ TOKEN_LIMIT = 32000
 MAX_FILE_CHARS = 5000
 SKVA_DIR = ".skva"
 
+# Auto-import skva_impl components
+try:
+    from skva_impl.checkpoint_system import CheckpointSystem
+except: pass
+try:
+    from skva_impl.git_sync import GitSync
+except: pass
+try:
+    from skva_impl.auto_mode import AutoMode
+except: pass
+try:
+    from skva_impl.dashboard import Dashboard
+except: pass
+try:
+    from skva_impl.gate_notifications import NotificationGateway
+except: pass
+try:
+    from skva_impl.agent_registry import AgentRegistry
+except: pass
+
 
 # ═══════════════════════════════════════════════════
 # RUN REPORT — live progress + final statistics
