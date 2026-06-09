@@ -2674,7 +2674,7 @@ async def modular_factory(tz_path: str, project_dir: str = ".") -> bool:
     log(f"Modules: {[m['name'] for m in modules]}")
     
     # 4. Parallel development with timeout + retry + quality gates
-    sem = asyncio.Semaphore(3)
+    sem = asyncio.Semaphore(1)
     
     async def dev(mod):
         async with sem:
